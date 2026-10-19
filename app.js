@@ -859,7 +859,7 @@ function renderTimetable() {
     : next ? `<div class="now-card"><span class="t"><b>Next: ${esc(subjectName(next.subject_id))}</b><br><small>at ${fmtTime(next.start_time)}</small></span></div>` : "";
   const counts = {}; for (const n of data.notes) counts[n.subject_id] = (counts[n.subject_id] || 0) + 1;
   const slots = data.slots.filter(s => s.day === ui.day).sort((a, b) => toMin(a.start_time) - toMin(b.start_time));
-  view.innerHTML = `<div class="page-head"><h1>Timetable</h1></div>${card}
+  view.innerHTML = `<div class="page-head"><h1>Timetable</h1><button class="btn primary" data-act="tt-import">${svg("photo")}Import from photo or PDF</button></div>${importHTML()}${card}
     <h2 class="section-title" style="margin-top:0">Subjects</h2>
     <div>${data.subjects.map(s => `<div class="subj-row"><span class="dot-c" style="--c:${s.color}"></span><span class="name"><b>${esc(s.name)}</b> <small>${esc(s.code || "")}${counts[s.id] ? " · " + counts[s.id] + (counts[s.id] === 1 ? " note" : " notes") : ""}</small></span>
       <button class="btn small" data-act="rename-subject" data-id="${esc(s.id)}">Rename</button><button class="icon-btn" data-act="delete-subject" data-id="${esc(s.id)}" aria-label="Delete ${esc(s.name)}">${svg("trash")}</button></div>`).join("") || `<p class="hint">Add each course you take this semester.</p>`}</div>
@@ -870,7 +870,7 @@ function renderTimetable() {
     <h2 class="section-title">Weekly classes</h2>
     <p class="hint" style="margin-top:-4px">Recordings and uploads are filed under whichever class is on at that time.</p>
     <div class="days" role="tablist">${WEEK.map(d => `<button type="button" role="tab" aria-selected="${d === ui.day}" data-act="day" data-day="${d}">${DAYS[d].slice(0, 3)}</button>`).join("")}</div>
-    <div>${slots.map(s => `<div class="slot${now && now.id === s.id ? " now" : ""}" style="--c:${subjectColor(s.subject_id)}"><span class="time">${fmtTime(s.start_time)} – ${fmtTime(s.end_time)}</span><span class="name">${esc(subjectName(s.subject_id))}</span><button class="icon-btn" data-act="delete-slot" data-id="${esc(s.id)}" aria-label="Remove this class">${svg("trash")}</button></div>`).join("") || `<p class="hint">No classes on ${DAYS[ui.day]} yet.</p>`}</div>
+    <div>${slots.map(s => `<div class="slot${now && now.id === s.id ? " now" : ""}" style="--c:${subjectColor(s.subject_id)}"><span class="time">${fmtTime(s.start_time)} – ${fmtTime(s.end_time)}</span><span class="name">${esc(subjectName(s.subject_id))}</span><button class="icon-btn" data-act="delete-slot" data-id="${esc(s.id)}" aria-label="Remove this class">${svg("trash")}</button></div>`).join("") || `<p class="hint">No classes on ${DAYS[ui.day]} yet. Add them below, or import your whole timetable from a photo or PDF.</p>`}</div>
     ${data.subjects.length ? `<form class="form-row" id="slotForm" style="margin-top:12px">
       <label>Subject<select id="slotSubject" required>${data.subjects.map(s => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join("")}</select></label>
       <label>Starts<input id="slotStart" type="time" required value="${esc(ui.lastEnd || "09:00")}"></label>
@@ -891,6 +891,106 @@ function renderTimetable() {
     data.slots.push(s); ui.lastEnd = end; renderTimetable();
     api.insert("slots", s).catch(err => { data.slots = data.slots.filter(x => x !== s); saveFail(err); renderTimetable(); });
   });
+}
+
+/* ---------- Import a timetable from a photo or PDF ---------- */
+const ttInput = Object.assign(document.createElement("input"), { type: "file", accept: "image/*,application/pdf,.pdf", hidden: true });
+document.body.append(ttInput);
+ttInput.onchange = e => { const f = e.target.files[0]; e.target.value = ""; if (f) importTimetable(f); };
+const TT_PROMPT = `This image or PDF is a college class timetable. Read it carefully and return only JSON in this shape:
+{"subjects":[{"name":"Calculus","code":"23MAT107"}],
+ "classes":[{"day":"Monday","start":"09:00","end":"09:50","subject":"23MAT107"}]}
+Rules:
+- Days run down one side or across the top; periods usually have their times in a header row. Use those times for each class.
+- Write times in 24-hour HH:MM. Afternoon classes such as 1:30 must become 13:30.
+- A class that spans several periods (like a lab) is one entry from the first start time to the last end time.
+- Skip breaks, lunch, free periods and empty cells.
+- If the timetable uses short codes or abbreviations and lists full course names elsewhere (often in a table underneath), use the full name and the course code.
+- "subject" in each class must match a subject's code, or its name when there is no code.
+- Don't invent anything that isn't in the timetable.`;
+function normDay(d) {
+  if (typeof d === "number") return d >= 0 && d <= 6 ? d : null;
+  const i = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"].indexOf(String(d).trim().slice(0, 3).toLowerCase());
+  return i < 0 ? null : i;
+}
+function normTime(t) {
+  const m = String(t || "").trim().toLowerCase().match(/^(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm)?/);
+  if (!m) return null;
+  let h = +m[1]; const min = +(m[2] || 0);
+  if (m[3] === "pm" && h < 12) h += 12;
+  if (m[3] === "am" && h === 12) h = 0;
+  if (!m[3] && h >= 1 && h <= 6) h += 12;   // college classes at "1:30" mean 1:30 pm
+  if (h > 23 || min > 59) return null;
+  return String(h).padStart(2, "0") + ":" + String(min).padStart(2, "0");
+}
+function findSubject(list, key) {
+  const k = String(key || "").trim().toLowerCase();
+  return list.find(s => (s.code && s.code.toLowerCase() === k) || s.name.toLowerCase() === k);
+}
+async function importTimetable(file) {
+  if (file.size > MAX_UPLOAD) { toast("That file is too large. Try a smaller photo or a single-page PDF."); return; }
+  ui.ttImport = { status: "reading" }; renderTimetable(); scroller.scrollTop = 0;
+  try {
+    let blob = file, mime = file.type || (/\.pdf$/i.test(file.name) ? "application/pdf" : "image/jpeg");
+    if (mime.startsWith("image/")) { try { blob = await drawImage(await createImageBitmap(file), 2200, .88); mime = "image/jpeg"; } catch {} }
+    const r = await callAI({ contents: [{ role: "user", parts: [{ inline_data: { mime_type: mime, data: await blobToBase64(blob) } }, { text: TT_PROMPT }] }], json: true, maxTokens: 8000, system: "You read college timetables accurately and output valid JSON only." });
+    let out; try { out = JSON.parse(r.text); } catch { out = parseJSON(r.text); }
+    const subjects = (out.subjects || []).filter(s => s && s.name).map(s => ({ name: String(s.name).trim().slice(0, 80), code: s.code ? String(s.code).trim().toUpperCase().slice(0, 30) : null }));
+    const classes = [];
+    for (const c of out.classes || []) {
+      const day = normDay(c.day), start = normTime(c.start), end = normTime(c.end);
+      if (day == null || !start || !end || toMin(end) <= toMin(start) || !c.subject) continue;
+      let subj = findSubject(subjects, c.subject);
+      if (!subj) { subj = { name: String(c.subject).trim().slice(0, 80), code: null }; subjects.push(subj); }
+      classes.push({ day, start, end, subject: subj });
+    }
+    if (!classes.length) throw new FriendlyError("I couldn't find any classes in that file. Try a clearer photo, taken straight on, with the whole timetable in view.");
+    ui.ttImport = { status: "review", subjects, classes, replace: false };
+  } catch (e) {
+    ui.ttImport = { status: "error", message: e instanceof FriendlyError ? e.message : "Couldn't read that timetable. Try again." };
+  }
+  if (currentRoute.startsWith("timetable")) renderTimetable(); else toast("Your timetable is ready to review in the Timetable tab");
+}
+function importHTML() {
+  const t = ui.ttImport; if (!t) return "";
+  if (t.status === "reading") return `<div class="import-card"><div class="processing" style="box-shadow:none;padding:10px">${mark("thinking")}<b>Reading your timetable</b><p class="hint">Finding subjects, days and class times. This takes a few seconds.</p></div></div>`;
+  if (t.status === "error") return `<div class="import-card"><b>Couldn't import that timetable</b><p class="hint">${esc(t.message)}</p><div class="row"><button class="btn primary" data-act="tt-import">Try another file</button><button class="btn" data-act="tt-cancel">Close</button></div></div>`;
+  const isNew = s => !findSubject(data.subjects, s.code || s.name) && !findSubject(data.subjects, s.name);
+  const byDay = WEEK.map(d => [d, t.classes.filter(c => c.day === d).sort((a, b) => toMin(a.start) - toMin(b.start))]).filter(([, list]) => list.length);
+  return `<div class="import-card">
+    <b>Found ${t.classes.length} classes and ${t.subjects.length} subjects</b>
+    <p class="hint">Check them, then add them to your timetable. You can fix anything by hand afterwards.</p>
+    <div class="import-subjects">${t.subjects.map(s => `<span class="badge${isNew(s) ? " ok" : ""}">${esc(s.name)}${s.code ? " · " + esc(s.code) : ""}${isNew(s) ? " · new" : ""}</span>`).join("")}</div>
+    <div class="import-days">${byDay.map(([d, list]) => `<div><b>${DAYS[d]}</b>${list.map(c => `<div class="import-slot"><span>${fmtTime(c.start)} – ${fmtTime(c.end)}</span>${esc(c.subject.name)}</div>`).join("")}</div>`).join("")}</div>
+    ${data.slots.length ? `<label class="import-replace"><input type="checkbox" id="ttReplace"> Replace the ${data.slots.length} classes already in my timetable</label>` : ""}
+    <div class="row"><button class="btn primary" data-act="tt-apply">Add to timetable</button><button class="btn" data-act="tt-cancel">Cancel</button></div>
+  </div>`;
+}
+async function applyTimetableImport(btn) {
+  const t = ui.ttImport; if (!t || t.status !== "review") return;
+  const replace = $("#ttReplace")?.checked;
+  btn.disabled = true; btn.textContent = "Adding…";
+  try {
+    if (replace) { const old = data.slots.slice(); data.slots = []; await Promise.all(old.map(sl => api.remove("slots", sl.id))); }
+    const newSubjects = [];
+    for (const s of t.subjects) {
+      let existing = findSubject(data.subjects, s.code || s.name) || findSubject(data.subjects, s.name);
+      if (!existing) { existing = { id: uuid(), name: s.name, code: s.code, color: COLORS[(data.subjects.length + newSubjects.length) % COLORS.length] }; newSubjects.push(existing); }
+      s.id = existing.id;
+    }
+    if (newSubjects.length) data.subjects.push(...await api.insertMany("subjects", newSubjects));
+    const seen = new Set(data.slots.map(sl => `${sl.day}|${sl.start_time}|${sl.subject_id}`));
+    const rows = [];
+    for (const c of t.classes) {
+      const key = `${c.day}|${c.start}|${c.subject.id}`;
+      if (seen.has(key)) continue; seen.add(key);
+      rows.push({ id: uuid(), day: c.day, start_time: c.start, end_time: c.end, subject_id: c.subject.id });
+    }
+    data.slots.push(...await api.insertMany("slots", rows));
+    ui.ttImport = null;
+    toast(`Added ${rows.length} classes${newSubjects.length ? ` and ${newSubjects.length} subjects` : ""}`); confetti(40);
+  } catch (e) { saveFail(e); btn.disabled = false; btn.textContent = "Add to timetable"; return; }
+  renderTimetable(); renderSidebar();
 }
 
 /* =====================================================================
@@ -950,6 +1050,9 @@ view.addEventListener("click", async e => {
       renderNote(qz.id); scroller.scrollTop = 0; break;
     }
     case "day": ui.day = +b.dataset.day; renderTimetable(); break;
+    case "tt-import": ttInput.click(); break;
+    case "tt-cancel": ui.ttImport = null; renderTimetable(); break;
+    case "tt-apply": applyTimetableImport(b); break;
     case "delete-slot": data.slots = data.slots.filter(s => s.id !== id); renderTimetable(); api.remove("slots", id).catch(saveFail); break;
     case "rename-subject": {
       const s = subjectById(id), name = prompt("Subject name", s.name); if (!name?.trim()) break;
