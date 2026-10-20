@@ -264,16 +264,16 @@ function subjectOptions(selected) {
    3. Talking to Gemini through the server function
    ===================================================================== */
 const MAX_UPLOAD = 14 * 1024 * 1024;
-const SYSTEM = `You are Study Buddy, a friendly study assistant for an Indian first-year B.Tech computer science student.
-- Explain clearly and step by step, with short examples. Prefer simple words.
-- Use Markdown: short paragraphs, bullet lists, and **bold** for the key terms a student should remember.
-- For code, use fenced code blocks and explain them briefly.
-- Write maths in LaTeX: $...$ for maths inside a sentence and $$...$$ on its own line for formulas.
-- For news, current affairs, prices, results or anything that may have changed recently, use Google Search and mention when the information is from.
-- Answer exactly what was asked, at a length that fits the question. Don't turn a question into a coding project, study plan or exercise unless the student asks for one.
-- Never invent facts. If you don't have reliable information about something, say so plainly instead of guessing.
+const SYSTEM = `You are Study Buddy, a helpful, knowledgeable general-purpose AI assistant, like ChatGPT, Claude or Perplexity. The person using you is a college student in India, but they can ask about anything: general knowledge, everyday questions, advice, writing, maths, coding, health, money, current events, or their studies.
+- Answer the question directly first, then add only the detail that helps. Match the length to the question: a short question gets a short answer.
+- Don't assume a question is about studying or computer science. Don't turn answers into lessons, coding projects, exercises or study plans unless asked. Give examples only when they make the answer clearer.
+- For anything recent or anything that may have changed (news, prices, results, people's current roles, dates), use Google Search and say when the information is from. Base factual answers on reliable sources; the app shows the sources under your answer.
+- Never invent facts, quotes, numbers, links or sources. If you don't know or can't verify something, say so plainly instead of guessing.
 - Questions about a person: answer only with well-established facts about public figures. If the name isn't someone you have reliable information about, say you don't have information about them and ask who they are or what they'd like to know. Never make up a biography, works, achievements or projects for a person, and don't speculate about private individuals.
-- This app can turn any answer into a PDF file. When the student asks for a PDF, a document, a handout or notes to download, write the complete content yourself right here in Markdown, starting with a # title. Never tell them to use another website or tool to make the PDF; the app adds a Download PDF button under your answer.`;
+- Reply in the same language the person writes in.
+- Use Markdown: short paragraphs, bullet lists when they help, and **bold** only for the few most important terms.
+- For code, use fenced code blocks. Write maths in LaTeX: $...$ inside a sentence and $$...$$ on its own line.
+- This app can turn any answer into a PDF file. When asked for a PDF, document, handout or notes to download, write the complete content yourself here in Markdown, starting with a # title. Never tell them to use another website or tool to make it; the app adds a Download PDF button under your answer.`;
 
 async function callAI({ contents, system = SYSTEM, search = false, json = false, maxTokens, stream = false, onDelta, signal }) {
   const { data: { session } } = await sb.auth.getSession();
@@ -417,7 +417,9 @@ function notesContext(question) {
   const picked = [];
   if (state.pinned && noteById(state.pinned)?.status === "ready") picked.push(noteById(state.pinned));
   const { range, subjectIds } = parseQuery(question);
-  let hits = searchNotes(question, { limit: 3 }).map(h => h.note);
+  // Only bring in notes when the question is clearly about the student's own classes, or matches a note strongly.
+  const aboutClasses = /\b(class|classes|lecture|notes?|homework|assignment|sir|ma'?am|madam|teacher|professor|taught|syllabus|exam|test|lab|record(ed|ing)?)\b/i.test(question) || range || subjectIds.length;
+  let hits = searchNotes(question, { limit: 3 }).filter(h => aboutClasses || h.score >= 10).map(h => h.note);
   if (!hits.length && (range || subjectIds.length) && /class|lecture|sir|mam|teacher|homework|taught|notes|learn/i.test(question)) {
     hits = sortedNotes(data.notes.filter(n => n.status === "ready" && (!range || (new Date(n.created_at) >= range[0] && new Date(n.created_at) <= range[1])) && (!subjectIds.length || subjectIds.includes(n.subject_id)))).slice(0, 3);
   }
@@ -710,7 +712,7 @@ async function renderShare(id) {
    7. Chat
    ===================================================================== */
 const IDEAS = [
-  ["Explain recursion with a simple example", "Study", "book"],
+  ["Help me write a polite leave letter to my HOD", "Writing", "edit"],
   ["What are today's top news headlines in India?", "Current affairs", "globe"],
   ["What was the homework in my last class?", "From your notes", "pdf"]
 ];
@@ -722,8 +724,8 @@ function renderChat() {
     const name = (state.user?.email || "").split("@")[0].split(/[._0-9]/)[0];
     const who = name && name.length > 1 ? ", " + esc(name[0].toUpperCase() + name.slice(1)) : "";
     view.innerHTML = `<section class="welcome"><div class="welcome-top">${mark("float")}<p class="hello">${greeting()}${who}</p></div>
-      <h1>${words("What are we")} <span class="w hl" style="--i:3">studying</span> <span class="w" style="--i:4">today?</span></h1>
-      <p>Ask about any subject, today's news, or your own past classes. Tap the red button to record a class.</p>
+      <h1>${words("What can I")} <span class="w hl" style="--i:3">help</span> <span class="w" style="--i:4">with?</span></h1>
+      <p>Ask me anything: questions, today's news, writing, maths or your own past classes. Tap the red button to record a class.</p>
       <div class="ideas">${IDEAS.map(([qq, t, icon], i) => `<button type="button" data-act="ask" data-q="${esc(qq)}" style="--i:${i}"><span class="ico">${svg(icon)}</span><b>${esc(qq)}</b><small>${t}</small></button>`).join("")}</div></section>`;
     return;
   }

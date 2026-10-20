@@ -200,7 +200,7 @@ async function tryGroq(input: Input, key: string): Promise<Response | null> {
   const maxTokens = Math.min(Number(input.maxTokens) || 4096, 8000);
 
   for (const model of [...new Set(models)]) {
-    const body: Record<string, unknown> = { model, messages, max_tokens: maxTokens, temperature: 0.4, stream: !!input.stream };
+    const body: Record<string, unknown> = { model, messages, max_tokens: maxTokens, temperature: 0.2, stream: !!input.stream };
     if (input.json) body.response_format = { type: "json_object" };
     let res: Response;
     try {
@@ -234,13 +234,53 @@ async function tryGroq(input: Input, key: string): Promise<Response | null> {
 type Source = { title: string; uri: string };
 const NEWSY = /\b(news|headlines?|today|tonight|yesterday|this week|latest|current affairs?|recent|recently|breaking|score|scores|match|won|wins|winner|result|results|election|elections|weather|price|prices|stock|sensex|nifty|launch|launched|announced|update|updates|happening|happened|trending)\b|\b20[2-9]\d\b/i;
 const newsCache = new WeakMap<Input, Promise<{ prompt: string; sources: Source[] } | null>>();
+// Live lookups for answers without Google Search: news headlines and Wikipedia facts, run together.
 function liveNews(input: Input) {
-  if (!newsCache.has(input)) newsCache.set(input, fetchNews(input).catch((e) => { console.warn("news lookup failed:", e); return null; }));
+  if (!newsCache.has(input)) newsCache.set(input, (async () => {
+    const [news, wiki] = await Promise.all([
+      fetchNews(input).catch((e) => { console.warn("news lookup failed:", e); return null; }),
+      fetchWiki(input).catch((e) => { console.warn("wikipedia lookup failed:", e); return null; }),
+    ]);
+    if (!news && !wiki) return null;
+    return { prompt: (news?.prompt ?? "") + (wiki?.prompt ?? ""), sources: [...(news?.sources ?? []), ...(wiki?.sources ?? [])].slice(0, 6) };
+  })());
   return newsCache.get(input)!;
+}
+const lastQuestion = (input: Input) => [...input.contents].reverse().find((c) => c.role !== "model")?.parts.map((p) => p.text ?? "").join(" ").trim() ?? "";
+
+/* Free, no key: Wikipedia. Used for factual questions (people, places, events, definitions) so the answer is checked
+   against a real source instead of the model's memory. */
+const FACTUAL = /\b(who|whom|whose|when|where|which|what is|what are|what was|what were|what's|define|definition|meaning of|tell me about|history of|founded|invented|discovered|born|died|capital of|president|prime minister|ceo|author of|written by|population|located)\b/i;
+async function fetchWiki(input: Input) {
+  const q = lastQuestion(input);
+  if (!q || !FACTUAL.test(q) || q.length > 300) return null;
+  const terms = q.replace(/\b(who|whom|whose|what|when|where|which|why|how|is|are|was|were|the|a|an|tell|me|about|please|can|you|do|does|did|define|definition|meaning|of|explain)\b/gi, " ").replace(/[^\p{L}\p{N}\s.-]/gu, " ").replace(/\s+/g, " ").trim();
+  if (terms.length < 2) return null;
+  const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), 6000);
+  const headers = { "User-Agent": "StudyBuddy/1.0 (student study app)" };
+  try {
+    const search = await fetch(`https://en.wikipedia.org/w/rest.php/v1/search/page?q=${encodeURIComponent(terms)}&limit=3`, { signal: ctrl.signal, headers });
+    if (!search.ok) throw new Error("Wikipedia " + search.status);
+    const pages: { key: string; title: string }[] = (await search.json()).pages ?? [];
+    const summaries = await Promise.all(pages.slice(0, 3).map(async (p) => {
+      const r = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(p.key)}`, { signal: ctrl.signal, headers });
+      if (!r.ok) return null;
+      const d = await r.json();
+      if (d.type === "disambiguation" || !d.extract) return null;
+      return { title: d.title as string, text: String(d.extract).slice(0, 1500), uri: d.content_urls?.desktop?.page ?? `https://en.wikipedia.org/wiki/${p.key}` };
+    }));
+    const found = summaries.filter((x): x is { title: string; text: string; uri: string } => !!x);
+    if (!found.length) return { prompt: "\n\nA Wikipedia search found nothing for this question. If it is about a specific person, place or event you don't have reliable facts about, say you don't have information on it instead of guessing.", sources: [] };
+    return {
+      prompt: "\n\nReference entries fetched from Wikipedia just now. Only use an entry if it is clearly about the same subject the student asked about (a different person with a similar name doesn't count). If none of them match and you don't have reliable facts, say you don't have information on it. Don't add details that aren't supported.\n" +
+        found.map((f, i) => `[${i + 1}] ${f.title}: ${f.text}`).join("\n"),
+      sources: found.map((f) => ({ title: "Wikipedia: " + f.title, uri: f.uri })),
+    };
+  } finally { clearTimeout(timer); }
 }
 const unxml = (s: string) => s.replace(/<!\[CDATA\[|\]\]>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim();
 async function fetchNews(input: Input) {
-  const question = [...input.contents].reverse().find((c) => c.role !== "model")?.parts.map((p) => p.text ?? "").join(" ").trim() ?? "";
+  const question = lastQuestion(input);
   if (!question || !NEWSY.test(question)) return null;
   const generic = /\b(top|today'?s|latest|main|major|breaking)\b.*\b(news|headlines?)\b|\bcurrent affairs?\b/i.test(question) && question.split(/\s+/).length <= 12;
   const india = /\bindia|indian\b/i.test(question) || !/\b(world|global|international|usa|america|uk|britain|china)\b/i.test(question);
