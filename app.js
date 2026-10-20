@@ -43,6 +43,7 @@ const ICONS = {
   globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
   check: '<path d="M20 6L9 17l-5-5"/>',
   cards: '<rect x="2" y="6" width="15" height="14" rx="2"/><path d="M7 2h13a2 2 0 0 1 2 2v12"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',
   mail: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M22 6l-10 7L2 6"/>'
 };
 /* Animated logo: the Study Buddy compass. Moods: "float" (gentle sway), "thinking" (slow spin), "done". */
@@ -216,7 +217,8 @@ const SYSTEM = `You are Study Buddy, a friendly study assistant for an Indian fi
 - Use Markdown: short paragraphs, bullet lists, and **bold** for the key terms a student should remember.
 - For code, use fenced code blocks and explain them briefly.
 - For news, current affairs, prices, results or anything that may have changed recently, use Google Search and mention when the information is from.
-- If you are not sure, say so instead of guessing.`;
+- If you are not sure, say so instead of guessing.
+- This app can turn any answer into a PDF file. When the student asks for a PDF, a document, a handout or notes to download, write the complete content yourself right here in Markdown, starting with a # title. Never tell them to use another website or tool to make the PDF; the app adds a Download PDF button under your answer.`;
 
 async function callAI({ contents, system = SYSTEM, search = false, json = false, maxTokens, stream = false, onDelta, signal }) {
   const { data: { session } } = await sb.auth.getSession();
@@ -381,6 +383,128 @@ function notesContext(question) {
     system: SYSTEM + `\n\nToday is ${today}. Below are the student's own saved class notes. When the question is about their classes, homework, or what a teacher said, answer from these notes and say which class it came from (subject and date). If the notes don't cover it, say that clearly, then answer from general knowledge if that helps. Don't use Google Search for questions about their own classes.` + block,
     refs: picked.slice(0, 4).map(n => ({ id: n.id, subject: subjectName(n.subject_id), date: n.created_at }))
   };
+}
+
+/* =====================================================================
+   PDF export: turns any answer or note into a real PDF on the device (no website needed).
+   Uses pdfmake, loaded only the first time someone downloads a PDF.
+   ===================================================================== */
+const PDF_LIBS = [
+  ["https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.10/pdfmake.min.js", "https://cdn.jsdelivr.net/npm/pdfmake@0.2.10/build/pdfmake.min.js"],
+  ["https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.10/vfs_fonts.min.js", "https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.10/vfs_fonts.js", "https://cdn.jsdelivr.net/npm/pdfmake@0.2.10/build/vfs_fonts.js"]
+];
+let pdfReady = null;
+function loadPdfLib() {
+  if (window.pdfMake?.vfs) return Promise.resolve();
+  return pdfReady ||= (async () => {
+    for (const urls of PDF_LIBS) {
+      let ok = false;
+      for (const u of urls) { try { await loadScript(u); ok = true; break; } catch {} }
+      if (!ok) throw new Error("load");
+    }
+    if (!window.pdfMake?.vfs && window.pdfMake?.addVirtualFileSystem && window.pdfFonts) pdfMake.addVirtualFileSystem(pdfFonts);
+  })().catch(e => { pdfReady = null; throw e; });
+}
+const PDF_COLORS = { ink: "#2B2147", muted: "#6E6690", accent: "#6C4CF1", hl: "#FFE27A", line: "#E9E2F8", code: "#F3EEFF" };
+function pdfInline(s) {
+  const out = [], re = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\)|(?:^|(?<=[^*]))\*[^*\s][^*]*\*)/g;
+  let last = 0, m;
+  while ((m = re.exec(s))) {
+    if (m.index > last) out.push({ text: s.slice(last, m.index) });
+    const t = m[0];
+    if (t.startsWith("**")) out.push({ text: t.slice(2, -2), bold: true, background: PDF_COLORS.hl });
+    else if (t.startsWith("`")) out.push({ text: t.slice(1, -1), background: PDF_COLORS.code, fontSize: 10 });
+    else if (t.startsWith("[")) { const mm = t.match(/^\[([^\]]+)\]\((.+)\)$/); out.push({ text: mm[1], link: mm[2], color: PDF_COLORS.accent, decoration: "underline" }); }
+    else out.push({ text: t.slice(1, -1), italics: true });
+    last = m.index + t.length;
+  }
+  if (last < s.length) out.push({ text: s.slice(last) });
+  return out.length ? out : [{ text: "" }];
+}
+function mdToPdf(markdown) {
+  const content = [];
+  String(markdown || "").split(/```/).forEach((part, i) => {
+    if (i % 2) {
+      content.push({ table: { widths: ["*"], body: [[{ text: part.replace(/^[^\n]*\n/, "").replace(/\n$/, ""), fontSize: 9, preserveLeadingSpaces: true, color: PDF_COLORS.ink }]] },
+        layout: { fillColor: () => PDF_COLORS.code, hLineWidth: () => 0, vLineWidth: () => 0, paddingLeft: () => 10, paddingRight: () => 10, paddingTop: () => 8, paddingBottom: () => 8 }, margin: [0, 4, 0, 10] });
+      return;
+    }
+    let list = null, para = [], table = [];
+    const flushPara = () => { if (para.length) { content.push({ text: para.flatMap((l, k) => [...pdfInline(l), ...(k < para.length - 1 ? [{ text: "\n" }] : [])]), margin: [0, 0, 0, 8] }); para = []; } };
+    const flushList = () => { if (list) { content.push({ [list.type]: list.items, margin: [0, 0, 0, 8] }); list = null; } };
+    const flushTable = () => {
+      if (!table.length) return;
+      const rows = table.filter(r => !/^\|?\s*:?-{2,}/.test(r)).map(r => r.replace(/^\||\|\s*$/g, "").split("|").map(c => c.trim()));
+      const cols = Math.max(...rows.map(r => r.length));
+      content.push({ table: { headerRows: 1, widths: Array(cols).fill("*"), body: rows.map((r, n) => Array.from({ length: cols }, (_, c) => ({ text: pdfInline(r[c] || ""), bold: n === 0, fontSize: 10 }))) },
+        layout: { fillColor: r => r === 0 ? PDF_COLORS.code : null, hLineColor: () => PDF_COLORS.line, vLineColor: () => PDF_COLORS.line }, margin: [0, 2, 0, 10] });
+      table = [];
+    };
+    for (const raw of part.split("\n")) {
+      const line = raw.replace(/\s+$/, ""); let m;
+      if (/^\s*\|.*\|$/.test(line)) { flushPara(); flushList(); table.push(line.trim()); continue; }
+      flushTable();
+      if (!line.trim()) { flushPara(); flushList(); continue; }
+      if ((m = line.match(/^(#{1,6})\s+(.*)/))) { flushPara(); flushList(); content.push({ text: pdfInline(m[2]).map(r => ({ ...r, background: undefined })), style: m[1].length <= 2 ? "h2" : "h3" }); continue; }
+      if ((m = line.match(/^\s*[-*•]\s+(.*)/))) { flushPara(); if (list?.type !== "ul") { flushList(); list = { type: "ul", items: [] }; } list.items.push({ text: pdfInline(m[1]), margin: [0, 1, 0, 2] }); continue; }
+      if ((m = line.match(/^\s*\d+[.)]\s+(.*)/))) { flushPara(); if (list?.type !== "ol") { flushList(); list = { type: "ol", items: [] }; } list.items.push({ text: pdfInline(m[1]), margin: [0, 1, 0, 2] }); continue; }
+      if (/^\s*(---|\*\*\*)\s*$/.test(line)) { flushPara(); flushList(); content.push({ canvas: [{ type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineColor: PDF_COLORS.line }], margin: [0, 4, 0, 10] }); continue; }
+      flushList(); para.push(line);
+    }
+    flushPara(); flushList(); flushTable();
+  });
+  return content;
+}
+function buildPdfDoc({ title, subtitle, markdown, sources }) {
+  let body = String(markdown || "");
+  // Use the answer's own first heading as the title instead of printing it twice.
+  const first = body.match(/^\s*#{1,2}\s+(.+)\n/);
+  if (first && first[1].replace(/[*_`]/g, "").trim() === title) body = body.slice(first[0].length);
+  const content = [
+    { text: "Study Buddy", style: "brand" },
+    { text: title, style: "title" },
+    { text: subtitle || new Date().toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" }), style: "subtitle" },
+    { canvas: [{ type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 2, lineColor: PDF_COLORS.accent }], margin: [0, 0, 0, 14] },
+    ...mdToPdf(body)
+  ];
+  if (sources?.length) content.push({ text: "Sources", style: "h3" }, { ul: sources.map(s => ({ text: s.title || s.uri, link: s.uri, color: PDF_COLORS.accent, fontSize: 10 })) });
+  return {
+    info: { title, creator: "Study Buddy" },
+    pageSize: "A4", pageMargins: [40, 48, 40, 52],
+    content,
+    footer: (page, pages) => ({ columns: [{ text: "Made with Study Buddy", color: PDF_COLORS.muted, fontSize: 8 }, { text: `${page} / ${pages}`, alignment: "right", color: PDF_COLORS.muted, fontSize: 8 }], margin: [40, 16, 40, 0] }),
+    defaultStyle: { font: "Roboto", fontSize: 11, lineHeight: 1.3, color: PDF_COLORS.ink },
+    styles: {
+      brand: { fontSize: 9, bold: true, color: PDF_COLORS.accent, margin: [0, 0, 0, 4] },
+      title: { fontSize: 22, bold: true, margin: [0, 0, 0, 4] },
+      subtitle: { fontSize: 10, color: PDF_COLORS.muted, margin: [0, 0, 0, 10] },
+      h2: { fontSize: 15, bold: true, color: PDF_COLORS.accent, margin: [0, 10, 0, 6] },
+      h3: { fontSize: 12.5, bold: true, margin: [0, 8, 0, 4] }
+    }
+  };
+}
+async function downloadPdf({ title, subtitle, markdown, sources, button }) {
+  const label = button?.innerHTML;
+  if (button) { button.disabled = true; button.textContent = "Making PDF…"; }
+  try {
+    await loadPdfLib();
+    const name = (title || "Study Buddy").replace(/[\\/:*?"<>|]+/g, "").replace(/\s+/g, " ").trim().slice(0, 80) + ".pdf";
+    const pdf = pdfMake.createPdf(buildPdfDoc({ title: title || "Study Buddy notes", subtitle, markdown, sources }));
+    const blob = await new Promise(ok => pdf.getBlob(ok));
+    const file = new File([blob], name, { type: "application/pdf" });
+    // Phones: open the share sheet so it can be saved to Files, Drive or sent on WhatsApp. Laptops: download.
+    if (matchMedia("(pointer: coarse)").matches && navigator.canShare?.({ files: [file] })) {
+      try { await navigator.share({ files: [file], title }); toast("PDF ready"); return; } catch (e) { if (e.name === "AbortError") return; }
+    }
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = name; document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    toast("PDF downloaded");
+  } catch {
+    toast("Couldn't make the PDF. Check your internet connection and try again.");
+  } finally {
+    if (button) { button.disabled = false; button.innerHTML = label; }
+  }
 }
 
 /* =====================================================================
@@ -563,9 +687,11 @@ function msgEl(m) {
   el.innerHTML = `${mark(m.pending ? "thinking" : "")}<div class="content">
     <div class="body${m.is_error ? " err" : ""}">${m.pending && !m.text ? `<div class="typing"><i></i><i></i><i></i><span>${esc(m.pending)}</span></div>` : md(m.text) + (m.pending ? '<span class="caret"></span>' : "")}</div>
     ${chips.length && !m.pending ? `<div class="chips">${chips.join("")}</div>` : ""}
-    ${!m.is_error && !m.pending ? `<div class="tools"><button type="button" class="copy">Copy</button>${m.backup ? `<span class="backup-tag" title="Gemini was busy, so the backup AI answered">Backup AI</span>` : ""}</div>` : ""}
+    ${!m.is_error && !m.pending && askedForPdf(m) ? `<button type="button" class="btn primary pdf-cta">${svg("download")}Download PDF</button>` : ""}
+    ${!m.is_error && !m.pending ? `<div class="tools"><button type="button" class="copy">Copy</button><button type="button" class="pdf">PDF</button>${m.backup ? `<span class="backup-tag" title="Gemini was busy, so the backup AI answered">Backup AI</span>` : ""}</div>` : ""}
     ${m.is_error && m.retry ? `<div class="tools"><button type="button" class="retry">Try again</button></div>` : ""}</div>`;
   el.querySelector(".copy")?.addEventListener("click", () => copy(m.text));
+  el.querySelectorAll(".pdf, .pdf-cta").forEach(b => b.addEventListener("click", () => downloadPdf({ markdown: m.text, title: pdfTitle(m), sources: m.sources, button: b })));
   el.querySelector(".retry")?.addEventListener("click", () => retryLast(m));
   return el;
 }
@@ -623,6 +749,14 @@ async function send(text) {
     if (chat) { chat.updated_at = new Date().toISOString(); state.chats = [chat, ...state.chats.filter(c => c !== chat)]; api.update("chats", chatId, { title: chat.title }).catch(() => {}); }
   }
   if (state.chatId === chatId && onChat()) renderChat();
+}
+function questionFor(m) { const i = state.messages.indexOf(m); for (let j = i - 1; j >= 0; j--) if (state.messages[j].role === "user") return state.messages[j].text; return ""; }
+const askedForPdf = m => /\bpdf\b|\bdownload(able)?\b|\bprintable\b|\bhandout\b/i.test(questionFor(m));
+function pdfTitle(m) {
+  const h = (m.text.match(/^#{1,3}\s+(.+)$/m) || [])[1];
+  if (h) return h.replace(/[*_`#]/g, "").trim();
+  const q = questionFor(m).replace(/\b(make|create|generate|give|send|write|me|a|an|the|pdf|of|on|about|for|please|can you|download)\b/gi, " ").replace(/\s+/g, " ").trim();
+  return q ? q[0].toUpperCase() + q.slice(1, 70) : "Study Buddy notes";
 }
 function retryLast(m) {
   if (state.busy || !m.retry) return;
@@ -769,6 +903,7 @@ function renderNote(id) {
       <button class="btn" data-act="edit" data-id="${esc(n.id)}" data-field="${tab === "transcript" ? "transcript" : "notes"}">${svg("edit")}Edit</button>
       <button class="btn" data-act="share" data-id="${esc(n.id)}">${svg("share")}${n.share_id ? "Share link" : "Share"}</button>
       ${n.share_id ? `<button class="btn" data-act="unshare" data-id="${esc(n.id)}">Stop sharing</button>` : ""}
+      <button class="btn" data-act="pdf-note" data-id="${esc(n.id)}">${svg("download")}Download PDF</button>
       <button class="btn" data-act="copy-note" data-id="${esc(n.id)}">Copy</button>
       <button class="btn danger" data-act="delete-note" data-id="${esc(n.id)}">${svg("trash")}Delete</button></div>` : "";
   view.innerHTML = head + `<div class="page-head"><h1>${esc(n.title)}</h1></div>${meta}
@@ -1032,6 +1167,12 @@ view.addEventListener("click", async e => {
       toast("Saved"); renderNote(id); break;
     }
     case "pin": state.pinned = id; if (!state.busy) { state.chatId = null; state.messages = []; } go("#/chat"); setTimeout(() => input.focus(), 50); toast("Ask anything about this class"); break;
+    case "pdf-note": {
+      const tab = ui.noteTab[id] === "transcript" ? "transcript" : "notes";
+      const s2 = subjectById(n.subject_id);
+      downloadPdf({ title: n.title, subtitle: `${s2 ? s2.name + (s2.code ? " (" + s2.code + ")" : "") : "Class notes"} · ${fmtDateTime(n.created_at)}`, markdown: tab === "notes" ? n.notes + (n.transcript ? "\n\n## Transcript\n" + n.transcript : "") : "## Transcript\n" + n.transcript, button: b });
+      break;
+    }
     case "copy-note": copy(`${n.title}\n${subjectName(n.subject_id)} · ${fmtDateTime(n.created_at)}\n\n${n.notes}${n.transcript ? "\n\nTranscript:\n" + n.transcript : ""}`); break;
     case "share": {
       if (!n.share_id) await patchNote(n, { share_id: shareCode() });
