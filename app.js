@@ -230,20 +230,24 @@ async function callAI({ contents, system = SYSTEM, search = false, json = false,
     });
   } catch (e) {
     if (e.name === "AbortError") throw e;
-    throw new FriendlyError("Couldn't reach the server. Check your internet connection and try again.");
+    const fe = new FriendlyError("Couldn't reach the server. Check your internet connection and try again.");
+    fe.busy = true; throw fe;
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     if (res.status === 404) throw new FriendlyError("The **gemini** server function isn't set up yet. Follow step 4 in SETUP.md.");
     if (res.status === 401) throw new FriendlyError(err.message || "Please sign in again.");
-    throw new FriendlyError(err.message || "The server had a problem (" + res.status + "). Try again in a minute.");
+    const fe = new FriendlyError(err.message || "The server had a problem (" + res.status + "). Try again in a minute.");
+    fe.busy = res.status === 503 || res.status >= 500 || (res.status === 429 && err.error !== "daily_limit");
+    throw fe;
   }
+  const backup = res.headers.get("X-Provider") === "groq";
   if (!stream) {
     const out = await res.json();
     const cand = out.candidates?.[0];
     const text = (cand?.content?.parts || []).map(p => p.text || "").join("").trim();
     if (!text) throw new FriendlyError(cand?.finishReason === "SAFETY" ? "Gemini declined to answer that." : "Gemini sent an empty reply. Try again.");
-    return { text, sources: (cand.groundingMetadata?.groundingChunks || []).map(c => c.web).filter(w => w?.uri).slice(0, 5) };
+    return { text, backup, sources: (cand.groundingMetadata?.groundingChunks || []).map(c => c.web).filter(w => w?.uri).slice(0, 5) };
   }
   // Streamed answer (server-sent events): show it word by word as it arrives.
   const reader = res.body.getReader(), dec = new TextDecoder();
@@ -272,11 +276,11 @@ async function callAI({ contents, system = SYSTEM, search = false, json = false,
     }
     if (buf.trim()) handle(buf);
   } catch (e) {
-    if (e.name === "AbortError") return { text, sources, stopped: true };
+    if (e.name === "AbortError") return { text, sources, backup, stopped: true };
     if (!text) throw new FriendlyError("The connection dropped. Try again.");
   }
-  if (!text.trim()) throw new FriendlyError("Gemini sent an empty reply. Try again.");
-  return { text, sources };
+  if (!text.trim()) throw new FriendlyError("The AI sent an empty reply. Try again.");
+  return { text, sources, backup };
 }
 function parseJSON(text) {
   try { return JSON.parse(text); } catch {}
@@ -554,8 +558,10 @@ function msgEl(m) {
   el.innerHTML = `${mark(m.pending ? "thinking" : "")}<div class="content">
     <div class="body${m.is_error ? " err" : ""}">${m.pending && !m.text ? `<div class="typing"><i></i><i></i><i></i><span>${esc(m.pending)}</span></div>` : md(m.text) + (m.pending ? '<span class="caret"></span>' : "")}</div>
     ${chips.length && !m.pending ? `<div class="chips">${chips.join("")}</div>` : ""}
-    ${!m.is_error && !m.pending ? `<div class="tools"><button type="button" class="copy">Copy</button></div>` : ""}</div>`;
+    ${!m.is_error && !m.pending ? `<div class="tools"><button type="button" class="copy">Copy</button>${m.backup ? `<span class="backup-tag" title="Gemini was busy, so the backup AI answered">Backup AI</span>` : ""}</div>` : ""}
+    ${m.is_error && m.retry ? `<div class="tools"><button type="button" class="retry">Try again</button></div>` : ""}</div>`;
   el.querySelector(".copy")?.addEventListener("click", () => copy(m.text));
+  el.querySelector(".retry")?.addEventListener("click", () => retryLast(m));
   return el;
 }
 const scrollDown = instant => requestAnimationFrame(() => { if (instant) scroller.style.scrollBehavior = "auto"; scroller.scrollTop = scroller.scrollHeight; scroller.style.scrollBehavior = ""; });
@@ -597,11 +603,11 @@ async function send(text) {
   state.abort = new AbortController();
   try {
     const r = await callAI({ contents: history, system: ctx.system, search: true, stream: true, signal: state.abort.signal, onDelta: t => { reply.text = t; if (!frame) frame = requestAnimationFrame(paint); } });
-    reply.text = r.text; reply.sources = r.sources;
+    reply.text = r.text; reply.sources = r.sources; reply.backup = !!r.backup;
     if (r.stopped) reply.text += "\n\n*Stopped.*";
   } catch (e) {
     if (e.name === "AbortError") reply.text = (reply.text || "") + "\n\n*Stopped.*";
-    else { reply.text = e instanceof FriendlyError ? e.message : "Something went wrong: " + e.message; reply.is_error = true; }
+    else { reply.text = e instanceof FriendlyError ? e.message : "Something went wrong: " + e.message; reply.is_error = true; reply.retry = text; }
   }
   if (frame) cancelAnimationFrame(frame);
   delete reply.pending;
@@ -612,6 +618,12 @@ async function send(text) {
     if (chat) { chat.updated_at = new Date().toISOString(); state.chats = [chat, ...state.chats.filter(c => c !== chat)]; api.update("chats", chatId, { title: chat.title }).catch(() => {}); }
   }
   if (state.chatId === chatId && onChat()) renderChat();
+}
+function retryLast(m) {
+  if (state.busy || !m.retry) return;
+  const i = state.messages.indexOf(m);
+  if (i > 0 && state.messages[i - 1].role === "user") state.messages.splice(i - 1, 2); else state.messages.splice(i, 1);
+  send(m.retry);
 }
 const chatSaves = {};
 function sleepUntilChatSaved(id) { return chatSaves[id] || Promise.resolve(); }
@@ -673,7 +685,7 @@ $("#newChatBtn").onclick = newChat;
    ===================================================================== */
 const best = n => Math.max(0, ...(n.scores || []).map(s => s.score / s.total));
 function noteRow(n, i = 0) {
-  const status = n.status === "processing" ? `<div class="spin" aria-label="Making notes"></div>` : n.status === "error" ? `<span class="badge bad">Needs retry</span>` :
+  const status = n.status === "processing" ? `<div class="spin" aria-label="Making notes"></div>` : n.status === "error" ? (autoRetry[n.id]?.timer ? `<span class="badge">Retrying soon</span>` : `<span class="badge bad">Needs retry</span>`) :
     (n.scores?.length ? `<span class="badge ${best(n) >= .7 ? "ok" : ""}">Quiz ${Math.round(best(n) * 100)}%</span>` : n.share_id ? `<span class="badge ok">Shared</span>` : "");
   return `<a class="note-row" href="#/note/${esc(n.id)}" style="--c:${subjectColor(n.subject_id)};--i:${Math.min(i, 8)}">
     <span class="ico">${svg(n.source)}</span>
@@ -725,8 +737,9 @@ function renderNote(id) {
     return;
   }
   if (n.status === "error") {
-    view.innerHTML = head + `<div class="page-head"><h1>Couldn't make notes</h1></div><div class="body err">${md(n.error || "Something went wrong.")}</div>
-      <div class="actions"><button class="btn primary" data-act="retry" data-id="${esc(n.id)}">Try again</button><button class="btn danger" data-act="delete-note" data-id="${esc(n.id)}">${svg("trash")}Delete</button></div>`;
+    const waiting = !!autoRetry[n.id]?.timer;
+    view.innerHTML = head + `<div class="page-head"><h1>${waiting ? "Waiting to try again" : "Couldn't make notes"}</h1></div><div class="body${waiting ? "" : " err"}">${md(n.error || "Something went wrong.")}</div>
+      <div class="actions"><button class="btn primary" data-act="retry" data-id="${esc(n.id)}">Try again now</button><button class="btn danger" data-act="delete-note" data-id="${esc(n.id)}">${svg("trash")}Delete</button></div>`;
     return;
   }
   const tabs = [["notes", "Notes"], ...(n.transcript ? [["transcript", "Transcript"]] : []), ["flash", "Flashcards"], ["quiz", "Quiz"]];
@@ -1029,7 +1042,7 @@ view.addEventListener("click", async e => {
       api.remove("notes", id).catch(saveFail); LocalDB.del("media", id).catch(() => {});
       if (state.pinned === id) state.pinned = null;
       toast("Deleted"); go("#/subject/" + (n.subject_id && subjectById(n.subject_id) ? n.subject_id : "unsorted")); break;
-    case "retry": processNote(id); break;
+    case "retry": if (autoRetry[id]?.timer) clearTimeout(autoRetry[id].timer); processNote(id); break;
     case "make-flash": makeStudyItems(id, "flash"); break;
     case "make-quiz": makeStudyItems(id, "quiz"); break;
     case "fc-flip": ui.fc.flipped = !ui.fc.flipped; renderNote(ui.fc.id); break;
@@ -1184,6 +1197,7 @@ The full transcript, with filler words removed and speaker labels (Teacher, Stud
 Write the notes in English. If parts are in Tamil or another language, translate them in the notes${isAudio ? " and keep the transcript in the language spoken" : ""}. Use **bold** for key terms. Don't invent anything that isn't in the material.`;
 }
 const processing = new Set();
+const autoRetry = {};
 async function processNote(id) {
   const n = noteById(id); if (!n || processing.has(id)) return;
   const media = await LocalDB.get("media", id).catch(() => null);
@@ -1208,7 +1222,14 @@ async function processNote(id) {
     LocalDB.del("media", id).catch(() => {});
     toast("Notes ready: " + n.title); confetti(50);
   } catch (e) {
-    await patchNote(n, { status: "error", error: e instanceof FriendlyError ? e.message : "Something went wrong: " + e.message });
+    const tries = (autoRetry[id]?.tries || 0) + 1;
+    if (e.busy && tries <= 5) {
+      const wait = [1, 2, 4, 8, 15][tries - 1];
+      autoRetry[id] = { tries, timer: setTimeout(() => { delete autoRetry[id].timer; processNote(id); }, wait * 60000) };
+      await patchNote(n, { status: "error", error: `${e.message}\n\nStudy Buddy will try again automatically in ${wait} minute${wait > 1 ? "s" : ""} while the app is open. Your file is saved on this device, so nothing is lost.` });
+    } else {
+      await patchNote(n, { status: "error", error: e instanceof FriendlyError ? e.message : "Something went wrong: " + e.message });
+    }
   }
   processing.delete(id);
   rerender();
@@ -1404,10 +1425,14 @@ async function onSignedIn(user) {
     const [subjects, slots, notes, chats] = await Promise.all([api.all("subjects"), api.all("slots"), api.all("notes", "created_at", false), api.all("chats", "updated_at", false)]);
     Object.assign(data, { subjects, slots, notes }); state.chats = chats;
   } catch (e) { saveFail(e); }
+  // Notes that failed earlier because the AI was busy: try them again now, if the file is still on this device.
+  for (const n of data.notes.filter(x => x.status === "error")) {
+    if (await LocalDB.get("media", n.id).catch(() => null)) setTimeout(() => processNote(n.id), 3000);
+  }
   for (const n of data.notes.filter(x => x.status === "processing")) {
     const local = await LocalDB.get("media", n.id).catch(() => null);
     const stale = Date.now() - new Date(n.created_at) > 10 * 60000;
-    if (local) patchNote(n, { status: "error", error: "The app was closed before the notes were finished. Tap **Try again**." });
+    if (local) { patchNote(n, { status: "error", error: "The app was closed before the notes were finished. Retrying now…" }); setTimeout(() => processNote(n.id), 1500); }
     else if (stale) patchNote(n, { status: "error", error: "This didn't finish. If you started it on another device, retry it there." });
   }
   await checkLegacy();

@@ -54,7 +54,10 @@ This is the part that keeps your Gemini key secret.
 7. Open **Edge Functions → Secrets** (or **Project Settings → Edge Functions → Secrets**) and add:
    - Name `GEMINI_API_KEY`, value: your new Gemini key
    - Name `DAILY_LIMIT`, value: `150` (optional; this is how many questions each person can ask per day)
+   - Name `GROQ_API_KEY`, value: a free key from **console.groq.com → API Keys** (recommended; this is the backup AI used whenever Gemini is busy)
 8. Click **Save**.
+
+With both keys set, Study Buddy tries Gemini first. If every Gemini model is busy or out of quota, the server switches to Groq on its own: chat and quizzes use a Llama model, photos use a vision model, recordings are transcribed with Whisper, and PDFs are read as text. Answers from the backup show a small "Backup AI" label. If both are busy, notes are retried automatically while the app is open.
 
 ## 5. Connect the app to Supabase
 
@@ -108,7 +111,7 @@ It's safe for these two values to be public. Row Level Security protects the dat
 | "The gemini server function isn't set up yet" | The function name must be exactly `gemini`. Check step 4. |
 | "The GEMINI_API_KEY secret isn't set" | Add the secret in step 4.7, then try again. |
 | "The server's Gemini key isn't valid" | Create a new key in AI Studio and replace the secret. |
-| "All Gemini models are busy" | Google's free models are overloaded. Wait a minute, or pick another model in your account settings. |
+| "Both Gemini and the backup AI are busy" | Both free services are overloaded. Wait a minute; notes retry on their own. If you haven't added `GROQ_API_KEY`, add it for a backup. |
 | A long recording fails but short ones work | Very large uploads can hit server limits. Record in parts of about 30 to 40 minutes. |
 | "You've used today's requests" | Each person has a daily limit, which resets at midnight (UTC). Change `DAILY_LIMIT` in the secrets to raise it. |
 

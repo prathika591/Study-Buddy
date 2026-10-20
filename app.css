@@ -459,3 +459,5 @@ dialog::backdrop{background:rgba(43,33,71,.45);backdrop-filter:blur(3px)}
 .import-slot span{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
 .import-replace{display:flex;gap:8px;align-items:center;font-size:.9rem;font-weight:700}
 .import-replace input{width:18px;height:18px;accent-color:var(--accent)}
+.backup-tag{font-size:.74rem;font-weight:800;color:var(--muted);background:var(--surface-2);border-radius:999px;padding:3px 9px;margin-left:4px;align-self:center}
+.tools button.retry{color:var(--accent);background:var(--accent-soft)}
