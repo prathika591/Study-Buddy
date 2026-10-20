@@ -94,10 +94,61 @@ function inline(s) {
        .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
   return s.replace(/\u0000(\d+)\u0000/g, (_, i) => "<code>" + codes[i] + "</code>");
 }
+/* ---------- Maths: LaTeX like \frac{a}{b} becomes real formulas with KaTeX (loaded the first time it's needed) ---------- */
+const MATH_DISPLAY = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]/g;
+const MATH_INLINE = /\\\(([\s\S]+?)\\\)|(?<![\\$\w])\$(?![\s\d])([^$\n]+?)(?<!\s)\$(?!\d)/g;
+const looksMathy = t => /[\\^_{}=<>+\-*/]|^[a-zA-Z]$/.test(t);
+function extractMath(part, store) {
+  return part
+    .replace(MATH_DISPLAY, (_, a, b) => { store.push({ tex: (a ?? b).trim(), display: true }); return `\n\u0001${store.length - 1}\u0001\n`; })
+    .replace(MATH_INLINE, (all, a, b) => { const tex = (a ?? b).trim(); if (b != null && !looksMathy(tex)) return all; store.push({ tex, display: false }); return `\u0001${store.length - 1}\u0001`; });
+}
+let katexState = "";
+function loadKatex() {
+  if (katexState) return;
+  katexState = "loading";
+  const css = document.createElement("link");
+  css.rel = "stylesheet"; css.href = "https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css";
+  document.head.append(css);
+  const js = document.createElement("script");
+  js.src = "https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js";
+  js.onload = () => { katexState = "ready"; if (typeof rerender === "function" && !state.busy) rerender(); };
+  js.onerror = () => { katexState = "failed"; };
+  document.head.append(js);
+}
+function renderMath({ tex, display }) {
+  if (window.katex) {
+    try { return katex.renderToString(tex, { displayMode: display, throwOnError: false, output: "html" }); } catch {}
+  } else loadKatex();
+  // Until KaTeX loads (or if it can't), show a readable version instead of raw code.
+  return `<span class="math-plain${display ? " block" : ""}">${esc(texToText(tex))}</span>`;
+}
+/* Readable plain-text maths, used in PDFs and as a fallback: \frac{a}{b} → (a)/(b), \times → ×, x^{2} → x² */
+function texToText(tex) {
+  const sym = { times: "×", cdot: "·", div: "÷", pm: "±", mp: "∓", le: "≤", leq: "≤", ge: "≥", geq: "≥", neq: "≠", ne: "≠", approx: "≈", equiv: "≡", infty: "∞", to: "→", rightarrow: "→", leftarrow: "←", Rightarrow: "⇒", iff: "⇔", sum: "Σ", prod: "Π", int: "∫", partial: "∂", nabla: "∇", Delta: "Δ", delta: "δ", alpha: "α", beta: "β", gamma: "γ", Gamma: "Γ", epsilon: "ε", varepsilon: "ε", theta: "θ", lambda: "λ", mu: "μ", pi: "π", rho: "ρ", sigma: "σ", Sigma: "Σ", tau: "τ", phi: "φ", varphi: "φ", omega: "ω", Omega: "Ω", eta: "η", degree: "°", circ: "°", ldots: "…", cdots: "…", dots: "…", in: "∈", forall: "∀", exists: "∃", cup: "∪", cap: "∩", subset: "⊂", angle: "∠", perp: "⊥", parallel: "∥", log: "log", ln: "ln", sin: "sin", cos: "cos", tan: "tan", lim: "lim", max: "max", min: "min" };
+  const sup = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹", "+": "⁺", "-": "⁻", "n": "ⁿ" };
+  let t = String(tex);
+  t = t.replace(/\\(left|right|displaystyle|textstyle|big|Big|bigg|Bigg)\b/g, "").replace(/\\[,;:! ]|\\q?quad\b/g, " ");
+  for (let k = 0; k < 6; k++) t = t.replace(/\\(?:text|mathrm|mathbf|mathit|operatorname|textbf)\{([^{}]*)\}/g, "$1");
+  for (let k = 0; k < 6; k++) {
+    const before = t;
+    t = t.replace(/\\[dt]?frac\{([^{}]*)\}\{([^{}]*)\}/g, (_, a, b) => `${/^[\w.]+$/.test(a.trim()) ? a.trim() : "(" + a.trim() + ")"} / ${/^[\w.]+$/.test(b.trim()) ? b.trim() : "(" + b.trim() + ")"}`)
+         .replace(/\\sqrt\{([^{}]*)\}/g, "√($1)");
+    if (t === before) break;
+  }
+  t = t.replace(/\^\{([^{}]*)\}|\^(\w)/g, (_, a, b) => { const v = a ?? b; return [...v].every(c => sup[c]) ? [...v].map(c => sup[c]).join("") : "^(" + v + ")"; })
+       .replace(/_\{([^{}]*)\}|_(\w)/g, (_, a, b) => "_" + (a ?? b))
+       .replace(/\\([A-Za-z]+)/g, (all, w) => sym[w] ?? w)
+       .replace(/[{}]/g, "").replace(/\s+/g, " ").trim();
+  return t;
+}
+
 function md(text) {
   let html = "";
+  const maths = [];
   String(text || "").split(/```/).forEach((part, i) => {
     if (i % 2) { html += "<pre><code>" + esc(part.replace(/^[^\n]*\n/, "")) + "</code></pre>"; return; }
+    part = extractMath(part, maths);
     let list = null, para = [], table = [];
     const flushPara = () => { if (para.length) { html += "<p>" + para.map(inline).join("<br>") + "</p>"; para = []; } };
     const flushList = () => { if (list) { html += `</${list}>`; list = null; } };
@@ -112,6 +163,7 @@ function md(text) {
       if (/^\s*\|.*\|$/.test(line)) { flushPara(); flushList(); table.push(line.trim()); continue; }
       flushTable();
       if (!line.trim()) { flushPara(); flushList(); continue; }
+      if ((m = line.match(/^\s*\u0001(\d+)\u0001\s*$/)) && maths[+m[1]]?.display) { flushPara(); html += `<div class="math-block">\u0001${m[1]}\u0001</div>`; continue; }
       if ((m = line.match(/^(#{1,6})\s+(.*)/))) { flushPara(); flushList(); const h = m[1].length <= 2 ? "h3" : "h4"; html += `<${h}>${inline(m[2])}</${h}>`; continue; }
       if ((m = line.match(/^\s*[-*•]\s+(.*)/))) { flushPara(); if (list !== "ul") { flushList(); html += "<ul>"; list = "ul"; } html += "<li>" + inline(m[1]) + "</li>"; continue; }
       if ((m = line.match(/^\s*\d+[.)]\s+(.*)/))) { flushPara(); if (list !== "ol") { flushList(); html += "<ol>"; list = "ol"; } html += "<li>" + inline(m[1]) + "</li>"; continue; }
@@ -120,7 +172,7 @@ function md(text) {
     }
     flushPara(); flushList(); flushTable();
   });
-  return html;
+  return maths.length ? html.replace(/\u0001(\d+)\u0001/g, (_, n) => maths[+n] ? renderMath(maths[+n]) : "") : html;
 }
 
 /* =====================================================================
@@ -216,6 +268,7 @@ const SYSTEM = `You are Study Buddy, a friendly study assistant for an Indian fi
 - Explain clearly and step by step, with short examples. Prefer simple words.
 - Use Markdown: short paragraphs, bullet lists, and **bold** for the key terms a student should remember.
 - For code, use fenced code blocks and explain them briefly.
+- Write maths in LaTeX: $...$ for maths inside a sentence and $$...$$ on its own line for formulas.
 - For news, current affairs, prices, results or anything that may have changed recently, use Google Search and mention when the information is from.
 - If you are not sure, say so instead of guessing.
 - This app can turn any answer into a PDF file. When the student asks for a PDF, a document, a handout or notes to download, write the complete content yourself right here in Markdown, starting with a # title. Never tell them to use another website or tool to make the PDF; the app adds a Download PDF button under your answer.`;
@@ -424,6 +477,7 @@ function pdfInline(s) {
 function mdToPdf(markdown) {
   const content = [];
   String(markdown || "").split(/```/).forEach((part, i) => {
+    if (!(i % 2)) part = part.replace(MATH_DISPLAY, (_, a, b) => "\n" + texToText(a ?? b) + "\n").replace(MATH_INLINE, (all, a, b) => b != null && !looksMathy(b.trim()) ? all : texToText(a ?? b));
     if (i % 2) {
       content.push({ table: { widths: ["*"], body: [[{ text: part.replace(/^[^\n]*\n/, "").replace(/\n$/, ""), fontSize: 9, preserveLeadingSpaces: true, color: PDF_COLORS.ink }]] },
         layout: { fillColor: () => PDF_COLORS.code, hLineWidth: () => 0, vLineWidth: () => 0, paddingLeft: () => 10, paddingRight: () => 10, paddingTop: () => 8, paddingBottom: () => 8 }, margin: [0, 4, 0, 10] });

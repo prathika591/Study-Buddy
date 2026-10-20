@@ -463,3 +463,8 @@ dialog::backdrop{background:rgba(43,33,71,.45);backdrop-filter:blur(3px)}
 .tools button.retry{color:var(--accent);background:var(--accent-soft)}
 .pdf-cta{margin-top:12px}
 .tools button.pdf{font-weight:800}
+.math-block{overflow-x:auto;overflow-y:hidden;margin:.7em 0;padding:4px 2px}
+.math-block .katex-display{margin:0}
+.math-plain{font-family:var(--mono);font-size:.92em;background:var(--surface-2);padding:.1em .4em;border-radius:6px}
+.math-plain.block{display:inline-block;padding:.5em .8em}
+.body .katex{font-size:1.08em}
