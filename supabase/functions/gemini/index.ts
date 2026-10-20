@@ -95,7 +95,10 @@ async function tryGemini(input: Input, key: string): Promise<{ response?: Respon
     let useSearch = !!input.search && !input.json;
     for (let attempt = 0; attempt < 2; attempt++) {
       const body: Record<string, unknown> = { contents: input.contents, generationConfig: { maxOutputTokens: Math.min(Number(input.maxTokens) || 8192, 32000) } };
-      if (input.system) body.systemInstruction = { parts: [{ text: String(input.system).slice(0, 200_000) }] };
+      // Without Google Search, a current-affairs question gets live headlines fetched by this server instead.
+      const news = input.search && !useSearch && !input.json ? await liveNews(input) : null;
+      const system = (input.system ?? "") + (news ? news.prompt : "");
+      if (system) body.systemInstruction = { parts: [{ text: system.slice(0, 200_000) }] };
       if (useSearch) body.tools = [{ google_search: {} }];
       if (input.json) (body.generationConfig as Record<string, unknown>).responseMimeType = "application/json";
       const url = GEMINI_API + model + (input.stream ? ":streamGenerateContent?alt=sse" : ":generateContent");
@@ -107,14 +110,17 @@ async function tryGemini(input: Input, key: string): Promise<{ response?: Respon
         const headers = { ...cors, "X-Model": model, "X-Provider": "gemini" };
         if (input.stream) {
           // Only commit to this model once real words arrive; an empty or failed stream moves on.
-          const stream = await primed(res.body!);
-          if (stream) { console.log("answered by", model); return { response: new Response(stream, { headers: { ...headers, "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } }), problem }; }
+          const stream = await primed(res.body!, news?.sources);
+          if (stream) { console.log("answered by", model, news ? "with live headlines" : ""); return { response: new Response(stream, { headers: { ...headers, "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } }), problem }; }
           problem = `${model}: empty stream`; console.warn(problem);
           if (useSearch) { useSearch = false; attempt--; continue; }   // try once more without Google Search
           break;
         }
         const out = await res.json();
-        if (hasText(out)) { console.log("answered by", model); return { response: json({ ...out, model, provider: "gemini" }, 200, headers), problem }; }
+        if (hasText(out)) {
+          if (news && out.candidates?.[0]) out.candidates[0].groundingMetadata ??= sourcesMeta(news.sources);
+          console.log("answered by", model); return { response: json({ ...out, model, provider: "gemini" }, 200, headers), problem };
+        }
         problem = `${model}: empty reply (${out?.candidates?.[0]?.finishReason ?? out?.promptFeedback?.blockReason ?? "no text"})`; console.warn(problem);
         if (useSearch) { useSearch = false; attempt--; continue; }
         break;
@@ -163,7 +169,9 @@ async function tryGroq(input: Input, key: string): Promise<Response | null> {
   let hasImage = false, transcript = "";
   const messages: Record<string, unknown>[] = [];
   let system = input.system ?? "";
-  if (input.search) system += "\n\nIf you can't search the web, say clearly when an answer might be out of date, especially for news, results or prices.";
+  const news = input.search && !input.json ? await liveNews(input) : null;
+  if (news) system += news.prompt;
+  else if (input.search) system += "\n\nIf you can't search the web, say clearly when an answer might be out of date, especially for news, results or prices.";
   if (input.json) system += "\n\nReply with a single JSON object only. If you are asked for a list, put it in the object under the key \"items\".";
 
   for (const c of input.contents) {
@@ -188,7 +196,7 @@ async function tryGroq(input: Input, key: string): Promise<Response | null> {
   if (transcript && !input.stream) system += "\n\nThe recording's transcript is given to you. Write the study notes, but leave out the Transcript section; it will be added separately.";
   if (system) messages.unshift({ role: "system", content: system });
 
-  const models = hasImage ? GROQ_VISION : [...(input.search && !input.json ? GROQ_SEARCH : []), ...GROQ_TEXT];
+  const models = hasImage ? GROQ_VISION : [...(input.search && !input.json && !news ? GROQ_SEARCH : []), ...GROQ_TEXT];
   const maxTokens = Math.min(Number(input.maxTokens) || 4096, 8000);
 
   for (const model of [...new Set(models)]) {
@@ -206,7 +214,7 @@ async function tryGroq(input: Input, key: string): Promise<Response | null> {
     }
     const headers = { ...cors, "X-Model": model, "X-Provider": "groq" };
     if (input.stream) {
-      const stream = await primed(groqToGeminiStream(res.body!));
+      const stream = await primed(groqToGeminiStream(res.body!), news?.sources);
       if (stream) { console.log("answered by Groq", model); return new Response(stream, { headers: { ...headers, "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } }); }
       console.warn(`Groq ${model}: empty stream`); continue;
     }
@@ -216,10 +224,47 @@ async function tryGroq(input: Input, key: string): Promise<Response | null> {
     if (!text.trim()) continue;
     if (input.json) text = unwrapJson(text);
     if (transcript) text = text.replace(/\n#{1,3}\s*Transcript[\s\S]*$/i, "").trim() + "\n\n## Transcript\n" + transcript;
-    return json({ candidates: [{ content: { parts: [{ text }] } }], model, provider: "groq" }, 200, headers);
+    return json({ candidates: [{ content: { parts: [{ text }] }, ...(news ? { groundingMetadata: sourcesMeta(news.sources) } : {}) }], model, provider: "groq" }, 200, headers);
   }
   return null;
 }
+
+/* ========================= Live news ========================= */
+// Free, no key: Google News RSS. Used only for current-affairs questions when Gemini's own search isn't available.
+type Source = { title: string; uri: string };
+const NEWSY = /\b(news|headlines?|today|tonight|yesterday|this week|latest|current affairs?|recent|recently|breaking|score|scores|match|won|wins|winner|result|results|election|elections|weather|price|prices|stock|sensex|nifty|launch|launched|announced|update|updates|happening|happened|trending)\b|\b20[2-9]\d\b/i;
+const newsCache = new WeakMap<Input, Promise<{ prompt: string; sources: Source[] } | null>>();
+function liveNews(input: Input) {
+  if (!newsCache.has(input)) newsCache.set(input, fetchNews(input).catch((e) => { console.warn("news lookup failed:", e); return null; }));
+  return newsCache.get(input)!;
+}
+const unxml = (s: string) => s.replace(/<!\[CDATA\[|\]\]>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim();
+async function fetchNews(input: Input) {
+  const question = [...input.contents].reverse().find((c) => c.role !== "model")?.parts.map((p) => p.text ?? "").join(" ").trim() ?? "";
+  if (!question || !NEWSY.test(question)) return null;
+  const generic = /\b(top|today'?s|latest|main|major|breaking)\b.*\b(news|headlines?)\b|\bcurrent affairs?\b/i.test(question) && question.split(/\s+/).length <= 12;
+  const india = /\bindia|indian\b/i.test(question) || !/\b(world|global|international|usa|america|uk|britain|china)\b/i.test(question);
+  const terms = question.replace(/\b(what|what's|whats|are|is|the|today'?s|today|tell|me|about|latest|news|headlines?|please|give|show|top|in|on|of|any|can|you)\b/gi, " ").replace(/[^\w\s-]/g, " ").replace(/\s+/g, " ").trim();
+  const base = "https://news.google.com/rss";
+  const locale = india ? "hl=en-IN&gl=IN&ceid=IN:en" : "hl=en-US&gl=US&ceid=US:en";
+  const url = generic || terms.length < 3 ? `${base}?${locale}` : `${base}/search?q=${encodeURIComponent(terms + " when:7d")}&${locale}`;
+  const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), 7000);
+  const res = await fetch(url, { signal: ctrl.signal, headers: { "User-Agent": "Mozilla/5.0 StudyBuddy" } }).finally(() => clearTimeout(timer));
+  if (!res.ok) throw new Error("Google News " + res.status);
+  const xml = await res.text();
+  const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 12).map((m) => {
+    const get = (tag: string) => unxml(m[1].match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`))?.[1] ?? "");
+    return { title: get("title"), link: get("link"), date: get("pubDate"), source: get("source") };
+  }).filter((i) => i.title && i.link);
+  if (!items.length) return null;
+  const now = new Date().toUTCString();
+  const lines = items.map((i, n) => `${n + 1}. ${i.title}${i.date ? ` (${i.date})` : ""}`).join("\n");
+  return {
+    prompt: `\n\nLive headlines fetched from Google News just now (${now}). Answer the question using these. Mention each story's source name, give the date, and don't add facts that aren't in the headlines. If the headlines don't answer the question, say so.\n${lines}`,
+    sources: items.slice(0, 5).map((i) => ({ title: i.source || i.title.split(" - ").pop() || "Google News", uri: i.link })),
+  };
+}
+const sourcesMeta = (sources: Source[]) => ({ groundingChunks: sources.map((s) => ({ web: s })) });
 
 /* ======================= Stream helpers ======================= */
 // True when a Gemini-format reply contains real answer text (not just "thinking" parts).
@@ -229,7 +274,7 @@ function hasText(out: unknown): boolean {
 }
 // Reads a Gemini-format event stream until the first real text arrives, then hands back a stream that replays
 // what was read and continues with the rest. Returns null if the stream ends or errors before any text.
-async function primed(body: ReadableStream<Uint8Array>): Promise<ReadableStream<Uint8Array> | null> {
+async function primed(body: ReadableStream<Uint8Array>, sources?: Source[]): Promise<ReadableStream<Uint8Array> | null> {
   const reader = body.getReader(), dec = new TextDecoder(), seen: Uint8Array[] = [];
   let buf = "", found = false;
   const deadline = Date.now() + 45_000;
@@ -253,7 +298,10 @@ async function primed(body: ReadableStream<Uint8Array>): Promise<ReadableStream<
   } catch { return null; }
   if (!found) { reader.cancel().catch(() => {}); return null; }
   return new ReadableStream<Uint8Array>({
-    start(ctrl) { for (const c of seen) ctrl.enqueue(c); },
+    start(ctrl) {
+      if (sources?.length) ctrl.enqueue(new TextEncoder().encode("data: " + JSON.stringify({ candidates: [{ groundingMetadata: sourcesMeta(sources) }] }) + "\n\n"));
+      for (const c of seen) ctrl.enqueue(c);
+    },
     async pull(ctrl) {
       try { const { value, done } = await reader.read(); if (done) ctrl.close(); else ctrl.enqueue(value); }
       catch { ctrl.close(); }
