@@ -105,8 +105,19 @@ async function tryGemini(input: Input, key: string): Promise<{ response?: Respon
       } catch (e) { problem = String(e); break; }
       if (res.ok) {
         const headers = { ...cors, "X-Model": model, "X-Provider": "gemini" };
-        if (input.stream) return { response: new Response(res.body, { headers: { ...headers, "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } }), problem };
-        return { response: json({ ...(await res.json()), model, provider: "gemini" }, 200, headers), problem };
+        if (input.stream) {
+          // Only commit to this model once real words arrive; an empty or failed stream moves on.
+          const stream = await primed(res.body!);
+          if (stream) { console.log("answered by", model); return { response: new Response(stream, { headers: { ...headers, "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } }), problem }; }
+          problem = `${model}: empty stream`; console.warn(problem);
+          if (useSearch) { useSearch = false; attempt--; continue; }   // try once more without Google Search
+          break;
+        }
+        const out = await res.json();
+        if (hasText(out)) { console.log("answered by", model); return { response: json({ ...out, model, provider: "gemini" }, 200, headers), problem }; }
+        problem = `${model}: empty reply (${out?.candidates?.[0]?.finishReason ?? out?.promptFeedback?.blockReason ?? "no text"})`; console.warn(problem);
+        if (useSearch) { useSearch = false; attempt--; continue; }
+        break;
       }
       const err = await res.json().catch(() => ({}));
       const msg: string = err?.error?.message ?? res.statusText;
@@ -194,7 +205,11 @@ async function tryGroq(input: Input, key: string): Promise<Response | null> {
       continue;   // retired model, too-large request, rate limit or busy: try the next model
     }
     const headers = { ...cors, "X-Model": model, "X-Provider": "groq" };
-    if (input.stream) return new Response(groqToGeminiStream(res.body!), { headers: { ...headers, "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
+    if (input.stream) {
+      const stream = await primed(groqToGeminiStream(res.body!));
+      if (stream) { console.log("answered by Groq", model); return new Response(stream, { headers: { ...headers, "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } }); }
+      console.warn(`Groq ${model}: empty stream`); continue;
+    }
 
     const out = await res.json();
     let text: string = out.choices?.[0]?.message?.content ?? "";
@@ -204,6 +219,47 @@ async function tryGroq(input: Input, key: string): Promise<Response | null> {
     return json({ candidates: [{ content: { parts: [{ text }] } }], model, provider: "groq" }, 200, headers);
   }
   return null;
+}
+
+/* ======================= Stream helpers ======================= */
+// True when a Gemini-format reply contains real answer text (not just "thinking" parts).
+function hasText(out: unknown): boolean {
+  const parts = (out as { candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] } }[] })?.candidates?.[0]?.content?.parts ?? [];
+  return parts.some((p) => !p.thought && !!p.text?.trim());
+}
+// Reads a Gemini-format event stream until the first real text arrives, then hands back a stream that replays
+// what was read and continues with the rest. Returns null if the stream ends or errors before any text.
+async function primed(body: ReadableStream<Uint8Array>): Promise<ReadableStream<Uint8Array> | null> {
+  const reader = body.getReader(), dec = new TextDecoder(), seen: Uint8Array[] = [];
+  let buf = "", found = false;
+  const deadline = Date.now() + 45_000;
+  try {
+    while (!found && Date.now() < deadline) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      seen.push(value);
+      buf += dec.decode(value, { stream: true }).replace(/\r/g, "");
+      let i;
+      while ((i = buf.indexOf("\n")) > -1) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!line.startsWith("data:")) continue;
+        try {
+          const ev = JSON.parse(line.slice(5).trim());
+          if (ev.error) { reader.cancel().catch(() => {}); return null; }
+          if (hasText(ev)) found = true;
+        } catch { /* partial or non-JSON line */ }
+      }
+    }
+  } catch { return null; }
+  if (!found) { reader.cancel().catch(() => {}); return null; }
+  return new ReadableStream<Uint8Array>({
+    start(ctrl) { for (const c of seen) ctrl.enqueue(c); },
+    async pull(ctrl) {
+      try { const { value, done } = await reader.read(); if (done) ctrl.close(); else ctrl.enqueue(value); }
+      catch { ctrl.close(); }
+    },
+    cancel() { reader.cancel().catch(() => {}); },
+  });
 }
 
 // The app expects lists for flashcards and quizzes; Groq's JSON mode wraps them in an object.

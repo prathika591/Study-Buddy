@@ -279,7 +279,12 @@ async function callAI({ contents, system = SYSTEM, search = false, json = false,
     if (e.name === "AbortError") return { text, sources, backup, stopped: true };
     if (!text) throw new FriendlyError("The connection dropped. Try again.");
   }
-  if (!text.trim()) throw new FriendlyError("The AI sent an empty reply. Try again.");
+  if (!text.trim()) {
+    // Rare, but some answers arrive empty when streamed; ask once more the ordinary way.
+    const again = await callAI({ contents, system, search, json, maxTokens, stream: false, signal });
+    onDelta?.(again.text);
+    return again;
+  }
   return { text, sources, backup };
 }
 function parseJSON(text) {
