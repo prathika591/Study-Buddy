@@ -35,11 +35,9 @@ This creates the tables for subjects, timetable, notes, chats and messages. Each
 2. Set **Site URL** to your app's address, for example:
    `https://YOUR-GITHUB-USERNAME.github.io/study-buddy/`
 3. Under **Redirect URLs**, click **Add URL** and add the same address. Click **Save**.
-4. Optional, but useful: open **Authentication → Emails → Magic Link** and add this line to the email:
-   `Or enter this code in the app: {{ .Token }}`
-   Then people can type the code if the link opens in the wrong browser.
+4. Open **Authentication → Sign In / Providers**, turn **Confirm email** off, and click **Save changes**. People then sign up with an email and password and are in straight away, with no email to open.
 
-Email sign-in is on by default. Supabase's built-in email sender only sends a few emails per hour, which is fine for you and a few friends. If more people use the app later, add your own email sender under **Authentication → Emails → SMTP Settings**.
+Study Buddy signs people in with an email and password. The only email it sends is the reset link when someone forgets their password; signed-in people can change their password in **Account** instead. Supabase's built-in email sender only sends a few emails per hour, which is fine for you and a few friends. If more people use the app later, add your own email sender under **Authentication → Emails → SMTP Settings**.
 
 ## 4. Create the server function that talks to Gemini
 

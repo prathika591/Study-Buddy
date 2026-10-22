@@ -632,7 +632,7 @@ function setAccountUI() {
    6. Sign in, setup and shared notes (pages shown outside the app)
    ===================================================================== */
 let authMsg = "";
-const APP_VERSION = "15";
+const APP_VERSION = "16";
 const authErr = e => {
   const m = e?.message || "";
   if (/invalid login credentials/i.test(m)) return "Wrong email or password. Try again, or tap Forgot password.";
@@ -665,7 +665,7 @@ function renderSignIn(stage = "signin", email = "") {
         ${emailField()}
         <label for="password">Password</label>
         <div class="pw-wrap"><input id="password" type="password" required autocomplete="current-password" placeholder="Your password">${eyeBtn("password")}</div>
-        <div class="auth-row"><a href="#" data-stage="forgot">Forgot password?</a><a href="#" data-stage="code">Sign in with a code</a></div>
+        <div class="auth-row"><a href="#" data-stage="forgot">Forgot password?</a></div>
         <button class="btn primary block" type="submit">Sign in</button>
         <div class="or">New to Study Buddy?</div>
         <button class="btn block" type="button" data-stage="signup">Create an account</button>
@@ -681,28 +681,24 @@ function renderSignIn(stage = "signin", email = "") {
         <div class="or">Already have an account?</div>
         <button class="btn block" type="button" data-stage="signin">Sign in</button>
       </form>`,
-    verify: `<h1>Check your <span class="hl">email</span>.</h1>
-      <p class="lead">We sent a 6-digit code to confirm it's you. It can take a minute, and might land in spam.</p>
+    verify: `<h1>Confirm your <span class="hl">email</span>.</h1>
+      <p class="lead">We sent you an email. Open it and tap the confirm button, then come back here and sign in.</p>
       <form class="auth-form${quick}" id="authForm" data-step="verify">${err}${chip}
-        ${codeField}
-        <button class="btn primary block" type="submit">Confirm and continue</button>
-        <div class="auth-row center"><a href="#" id="resend">Send a new code</a></div>
+        <button class="btn primary block" type="button" data-stage="signin">I've confirmed, sign in</button>
+        <div class="auth-row center"><a href="#" id="resend">Send the email again</a></div>
       </form>`,
     forgot: `<h1>Reset your <span class="hl">password</span>.</h1>
-      <p class="lead">Enter your email and we'll send you a 6-digit code. If you used sign-in links before, do this once to set a password.</p>
+      <p class="lead">Enter your email and we'll send you a link to choose a new password. Already signed in on another device? Set it there instead, in Account.</p>
       <form class="auth-form${quick}" id="authForm" data-step="forgot">${err}
         ${emailField()}
-        <button class="btn primary block" type="submit">Send code</button>
+        <button class="btn primary block" type="submit">Send reset link</button>
         <div class="auth-row center"><a href="#" data-stage="signin">Back to sign in</a></div>
       </form>`,
-    reset: `<h1>Choose a new <span class="hl">password</span>.</h1>
-      <p class="lead">Enter the 6-digit code we emailed you, then pick a new password.</p>
+    reset: `<h1>Check your <span class="hl">email</span>.</h1>
+      <p class="lead">We sent a reset link. Tap it and Study Buddy opens so you can choose a new password. It can take a minute, and might land in spam.</p>
       <form class="auth-form${quick}" id="authForm" data-step="reset">${err}${chip}
-        ${codeField}
-        <label for="password">New password</label>
-        <div class="pw-wrap"><input id="password" type="password" required minlength="8" autocomplete="new-password" placeholder="At least 8 characters">${eyeBtn("password")}</div>
-        <button class="btn primary block" type="submit">Save and sign in</button>
-        <div class="auth-row center"><a href="#" id="resend">Send a new code</a></div>
+        <button class="btn primary block" type="button" data-stage="signin">Back to sign in</button>
+        <div class="auth-row center"><a href="#" id="resend">Send the link again</a></div>
       </form>`,
     code: `<h1>Sign in with a <span class="hl">code</span>.</h1>
       <p class="lead">No password? We'll email you a 6-digit code instead.</p>
@@ -731,9 +727,9 @@ function renderSignIn(stage = "signin", email = "") {
   $("#resend")?.addEventListener("click", async e => {
     e.preventDefault();
     const { error } = stage === "verify" ? await sb.auth.resend({ type: "signup", email })
-      : stage === "reset" ? await sb.auth.resetPasswordForEmail(email)
+      : stage === "reset" ? await sb.auth.resetPasswordForEmail(email, { redirectTo: location.origin + location.pathname })
       : await sb.auth.signInWithOtp({ email, options: { shouldCreateUser: false } });
-    toast(error ? authErr(error) : "New code sent. Check your email.");
+    toast(error ? authErr(error) : "Sent again. Check your email, and the spam folder.");
   });
   form.addEventListener("submit", async e => {
     e.preventDefault();
@@ -744,7 +740,7 @@ function renderSignIn(stage = "signin", email = "") {
     try {
       if (stage === "signin") {
         const { error } = await sb.auth.signInWithPassword({ email: addr, password: pw });
-        if (error && /not confirmed/i.test(error.message)) { await sb.auth.resend({ type: "signup", email: addr }); authMsg = "Confirm your email first. We've sent you a new code."; renderSignIn("verify", addr); return; }
+        if (error && /not confirmed/i.test(error.message)) { await sb.auth.resend({ type: "signup", email: addr }); renderSignIn("verify", addr); return; }
         if (error) return fail(error);
       } else if (stage === "signup") {
         if (pw.length < 8) return fail({ message: "password at least" });
@@ -756,7 +752,7 @@ function renderSignIn(stage = "signin", email = "") {
         const { error } = await sb.auth.verifyOtp({ email: addr, token: code, type: "signup" });
         if (error) return fail(error);
       } else if (stage === "forgot") {
-        const { error } = await sb.auth.resetPasswordForEmail(addr);
+        const { error } = await sb.auth.resetPasswordForEmail(addr, { redirectTo: location.origin + location.pathname });
         if (error) return fail(error);
         renderSignIn("reset", addr);
       } else if (stage === "reset") {
@@ -1776,6 +1772,16 @@ $("#accountForm").addEventListener("submit", () => {
   state.provider = $("#providerSelect").value; prefs.set("provider", state.provider);
   state.theme = $("#themeSelect").value; prefs.set("theme", state.theme); applyTheme();
 });
+$("#accountDlg .pw-eye").onclick = () => { const i = $("#newPw"); i.type = i.type === "password" ? "text" : "password"; };
+$("#savePwBtn").onclick = async () => {
+  const pw = $("#newPw").value, btn = $("#savePwBtn");
+  if (pw.length < 8) { toast("Use at least 8 characters"); return; }
+  btn.disabled = true;
+  const { error } = await sb.auth.updateUser({ password: pw });
+  btn.disabled = false;
+  if (error) { toast(/different from the old|same/i.test(error.message) ? "That's already your password" : authErr(error)); return; }
+  $("#newPw").value = ""; toast("Password saved. Use it to sign in on any device.");
+};
 $("#signOutBtn").onclick = async () => {
   if (rec && !confirm("You're recording. Sign out and discard it?")) return;
   if (rec) await stopRecording(false);
@@ -1885,6 +1891,7 @@ function onSignedOut() {
   const hp = new URLSearchParams(location.hash.replace(/^#\/?/, ""));
   if (hp.get("error_description")) { authMsg = hp.get("error_description").replace(/\+/g, " ") + ". Request a new link."; history.replaceState(null, "", location.pathname); }
   sb.auth.onAuthStateChange((event, session) => {
+    if (event === "PASSWORD_RECOVERY") setTimeout(() => { openAccount(); toast("Choose a new password, then tap Save password"); setTimeout(() => $("#newPw")?.focus(), 300); }, 1200);
     if (session?.user) { if (!state.user || state.user.id !== session.user.id) setTimeout(() => onSignedIn(session.user)); }
     else if (event === "SIGNED_OUT" && state.user) setTimeout(onSignedOut);
   });
