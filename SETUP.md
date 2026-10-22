@@ -53,11 +53,14 @@ This is the part that keeps your Gemini key secret.
 6. Click **Deploy function**.
 7. Open **Edge Functions → Secrets** (or **Project Settings → Edge Functions → Secrets**) and add:
    - Name `GEMINI_API_KEY`, value: your new Gemini key
-   - Name `DAILY_LIMIT`, value: `150` (optional; this is how many questions each person can ask per day)
-   - Name `GROQ_API_KEY`, value: a free key from **console.groq.com → API Keys** (recommended; this is the backup AI used whenever Gemini is busy)
+   - Name `GROQ_API_KEY`, value: a free key from **console.groq.com → API Keys** (recommended; Groq also transcribes recordings with Whisper)
+   - Name `MISTRAL_API_KEY`, value: a free key from **console.mistral.ai → API Keys** (choose the free **Experiment** plan; it asks to verify your phone number)
+   - Name `OPENROUTER_API_KEY`, value: a free key from **openrouter.ai → Keys** (gives access to several free models)
 8. Click **Save**.
 
-With both keys set, Study Buddy tries Gemini first. If every Gemini model is busy or out of quota, the server switches to Groq on its own: chat and quizzes use a Llama model, photos use a vision model, recordings are transcribed with Whisper, and PDFs are read as text. Answers from the backup show a small "Backup AI" label. If both are busy, notes are retried automatically while the app is open.
+You only need `GEMINI_API_KEY`, but every extra key is one more AI that can answer when the others are busy. Study Buddy tries them in order: Gemini, Groq, Mistral, then OpenRouter. If one is busy or out of free quota, the server moves to the next on its own. Answers from anything other than Gemini show a small "Backup AI" label. In **Account**, you can pick which AI to try first.
+
+There is no daily limit in the app. Each AI service still has its own free limits, which is why having several keys helps.
 
 ## 5. Connect the app to Supabase
 
@@ -70,7 +73,6 @@ With both keys set, Study Buddy tries Gemini first. If every Gemini model is bus
 window.STUDY_BUDDY_CONFIG = {
   supabaseUrl: "https://abcdxyz.supabase.co",
   supabaseAnonKey: "paste the anon public key here",
-  dailyLimit: 150,
   googleSignIn: false
 };
 ```
@@ -111,9 +113,10 @@ It's safe for these two values to be public. Row Level Security protects the dat
 | "The gemini server function isn't set up yet" | The function name must be exactly `gemini`. Check step 4. |
 | "The GEMINI_API_KEY secret isn't set" | Add the secret in step 4.7, then try again. |
 | "The server's Gemini key isn't valid" | Create a new key in AI Studio and replace the secret. |
-| "Both Gemini and the backup AI are busy" | Both free services are overloaded. Wait a minute; notes retry on their own. If you haven't added `GROQ_API_KEY`, add it for a backup. |
-| A long recording fails but short ones work | Very large uploads can hit server limits. Record in parts of about 30 to 40 minutes. |
-| "You've used today's requests" | Each person has a daily limit, which resets at midnight (UTC). Change `DAILY_LIMIT` in the secrets to raise it. |
+| "All the AI services are busy right now" | Every service you've added is overloaded or out of free quota. Wait a minute; notes retry on their own. Add more keys from step 4.7. |
+| "Record an online meeting" is missing | It needs Chrome or Edge on a laptop. On a phone, upload the meeting's recording instead. |
+| A meeting recording has only your voice | When sharing, pick the meeting's **tab** and switch on **Share tab audio**. |
+| A long recording or video fails | Long files are split into 15-minute parts on your device first. If your browser runs out of memory, upload just the audio or a shorter part. |
 
 ## How it fits together
 
@@ -126,6 +129,7 @@ It's safe for these two values to be public. Row Level Security protects the dat
  │ Keeps unsent files locally │   ask AI    │ Edge Function      │  Gemini key  ┌────────────┐
  └───────────────────────────┘ ──────────▶ │ "gemini"           │ ───────────▶ │ Gemini API │
                                             │ checks login +     │ ◀─ stream ── └────────────┘
-                                            │ daily limit        │
+                                            │ Groq, Mistral,     │
+                                            │ OpenRouter backups │
                                             └────────────────────┘
 ```

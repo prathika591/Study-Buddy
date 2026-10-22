@@ -183,7 +183,6 @@ const configured = !!(CFG.supabaseUrl && CFG.supabaseAnonKey && !/YOUR-/.test(CF
 const sb = configured && window.supabase ? window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey, {
   auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, flowType: "implicit" }
 }) : null;
-const DAILY_LIMIT = Number(CFG.dailyLimit) || 150;
 
 const prefs = {
   get(k, d) { try { const v = localStorage.getItem("sb." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
@@ -232,12 +231,13 @@ const saveFail = e => toast(e instanceof FriendlyError ? e.message : "Couldn't s
 const state = {
   user: null,
   model: prefs.get("model", "gemini-3.5-flash-lite"),
+  provider: prefs.get("provider", "auto"),
   theme: prefs.get("theme", ""),
   chats: [], chatId: null, messages: [],
   pinned: null, busy: false, abort: null, loaded: false
 };
 const data = { subjects: [], slots: [], notes: [] };
-const ui = { noteTab: {}, edit: null, day: new Date().getDay(), searchQ: "", fc: null, qz: null, generating: {}, legacy: null };
+const ui = { progress: {}, noteTab: {}, edit: null, day: new Date().getDay(), searchQ: "", fc: null, qz: null, generating: {}, legacy: null };
 
 const noteById = id => data.notes.find(n => n.id === id);
 const subjectById = id => data.subjects.find(s => s.id === id);
@@ -275,7 +275,7 @@ const SYSTEM = `You are Study Buddy, a helpful, knowledgeable general-purpose AI
 - For code, use fenced code blocks. Write maths in LaTeX: $...$ inside a sentence and $$...$$ on its own line.
 - This app can turn any answer into a PDF file. When asked for a PDF, document, handout or notes to download, write the complete content yourself here in Markdown, starting with a # title. Never tell them to use another website or tool to make it; the app adds a Download PDF button under your answer.`;
 
-async function callAI({ contents, system = SYSTEM, search = false, json = false, maxTokens, stream = false, onDelta, signal }) {
+async function callAI({ contents, system = SYSTEM, search = false, json = false, maxTokens, stream = false, onDelta, signal, task }) {
   const { data: { session } } = await sb.auth.getSession();
   if (!session) throw new FriendlyError("You've been signed out. Sign in again to continue.");
   let res;
@@ -283,7 +283,7 @@ async function callAI({ contents, system = SYSTEM, search = false, json = false,
     res = await fetch(CFG.supabaseUrl.replace(/\/$/, "") + "/functions/v1/gemini", {
       method: "POST", signal,
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + session.access_token, apikey: CFG.supabaseAnonKey },
-      body: JSON.stringify({ contents, system, search, json, maxTokens, stream, model: state.model })
+      body: JSON.stringify({ contents, system, search, json, maxTokens, stream, task, model: state.model, provider: state.provider })
     });
   } catch (e) {
     if (e.name === "AbortError") throw e;
@@ -338,7 +338,7 @@ async function callAI({ contents, system = SYSTEM, search = false, json = false,
   }
   if (!text.trim()) {
     // Rare, but some answers arrive empty when streamed; ask once more the ordinary way.
-    const again = await callAI({ contents, system, search, json, maxTokens, stream: false, signal });
+    const again = await callAI({ contents, system, search, json, maxTokens, stream: false, signal, task });
     onDelta?.(again.text);
     return again;
   }
@@ -929,8 +929,10 @@ function renderNote(id) {
   if (n.status === "processing") {
     const audio = n.source === "recording" || n.source === "audio";
     const steps = [`Reading the ${audio ? "recording" : n.source === "pdf" ? "PDF" : n.source === "photo" ? "photos" : "text"}`, "Writing a summary, key terms and homework", ...(audio ? ["Cleaning up the transcript"] : [])];
-    view.innerHTML = head + `<div class="processing">${mark("thinking")}<b>Making your notes</b><p class="hint">${audio ? "Long classes can take a minute or two." : "This usually takes under a minute."} You can keep using the app.</p>
-      <ul class="steps">${steps.map((t, i) => `<li style="--i:${i}">${t}</li>`).join("")}</ul></div>`;
+    const pr = ui.progress[n.id];
+    view.innerHTML = head + `<div class="processing">${mark("thinking")}<b>Making your notes</b><p class="hint">${audio ? "Long recordings take about a minute for every 15 minutes." : "This usually takes under a minute."} You can keep using the app, but keep it open.</p>
+      ${pr ? `<div class="progress" style="max-width:320px;margin:14px auto 6px"><div style="width:${Math.round(pr.frac * 100)}%"></div></div><p class="hint" style="margin:0"><b>${esc(pr.label)}…</b></p>`
+           : `<ul class="steps">${steps.map((t, i) => `<li style="--i:${i}">${t}</li>`).join("")}</ul>`}</div>`;
     return;
   }
   if (n.status === "error") {
@@ -1300,6 +1302,7 @@ view.addEventListener("keydown", e => { if ((e.key === "Enter" || e.key === " ")
    ===================================================================== */
 let pendingSubject = "";
 function openAdd(preset) {
+  $("#meetingOption").hidden = !canRecordMeetings();
   pendingSubject = preset !== undefined && preset !== null ? preset : subjectAt(new Date());
   $("#addSubject").innerHTML = subjectOptions(pendingSubject);
   $("#addDlg").showModal();
@@ -1310,6 +1313,7 @@ $("#addDlg").addEventListener("click", e => {
   $("#addDlg").close();
   const kind = b.dataset.add, pickers = { camera: "#cameraInput", photo: "#photoInput", pdf: "#pdfInput", audio: "#audioInput" };
   if (kind === "record") startRecording(pendingSubject);
+  else if (kind === "meeting") startRecording(pendingSubject, { meeting: true });
   else if (kind === "text") { $("#textInput").value = ""; $("#textDlg").showModal(); }
   else if (pickers[kind]) $(pickers[kind]).click();
 });
@@ -1321,11 +1325,18 @@ $("#textForm").addEventListener("submit", e => {
   createNote({ source: "text", subjectId: pendingSubject, text });
 });
 $("#pdfInput").onchange = e => { const f = e.target.files[0]; e.target.value = ""; if (f) createNote({ source: "pdf", subjectId: pendingSubject, parts: [{ mime: "application/pdf", blob: f }], fileName: f.name }); };
-$("#audioInput").onchange = e => {
+$("#audioInput").onchange = async e => {
   const f = e.target.files[0]; e.target.value = ""; if (!f) return;
   const ext = (f.name.split(".").pop() || "").toLowerCase();
-  const types = { mp3: "audio/mpeg", m4a: "audio/mp4", wav: "audio/wav", ogg: "audio/ogg", aac: "audio/aac", flac: "audio/flac", webm: "audio/webm" };
-  createNote({ source: "audio", subjectId: pendingSubject, parts: [{ mime: f.type || types[ext] || "audio/mpeg", blob: f }], fileName: f.name });
+  const types = { mp3: "audio/mpeg", m4a: "audio/mp4", wav: "audio/wav", ogg: "audio/ogg", aac: "audio/aac", flac: "audio/flac", webm: "audio/webm", mp4: "video/mp4", mov: "video/quicktime", mkv: "video/x-matroska" };
+  const mime = f.type || types[ext] || "audio/mpeg";
+  const subjectId = pendingSubject;
+  // Short audio goes as it is. Videos and long recordings are turned into 15-minute MP3 parts on this device first.
+  if (mime.startsWith("audio/") && f.size <= SPLIT_OVER) { createNote({ source: "audio", subjectId, parts: [{ mime, blob: f }], fileName: f.name }); return; }
+  try {
+    const { parts, minutes } = await splitAudioFile(f, pct => toast(`Preparing ${f.name.length > 28 ? "your recording" : f.name}… ${pct}%`));
+    createNote({ source: "audio", subjectId, parts, fileName: f.name, minutes });
+  } catch (err) { toast(err instanceof FriendlyError ? err.message : "Couldn't read that file. Try an MP3 or M4A, or a shorter recording."); }
 };
 function drawImage(bmp, max, quality) {
   const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
@@ -1350,7 +1361,8 @@ $("#photoInput").onchange = e => { const f = [...e.target.files]; e.target.value
 $("#cameraInput").onchange = e => { const f = [...e.target.files]; e.target.value = ""; onPhotos(f); };
 
 async function createNote({ source, subjectId = "", parts = [], text = "", fileName = "", minutes = 0, thumbs = [], created }) {
-  const size = parts.reduce((t, p) => t + p.blob.size, 0);
+  const audioParts = parts.length > 1 && parts.every(p => p.mime.startsWith("audio/"));
+  const size = audioParts ? Math.max(...parts.map(p => p.blob.size)) : parts.reduce((t, p) => t + p.blob.size, 0);
   if (size > MAX_UPLOAD) { toast(`That's ${(size / 1048576).toFixed(1)} MB. The limit is about 14 MB, so split it into smaller parts.`); return; }
   const n = { id: uuid(), subject_id: subjectId || null, source, title: "Making notes…", status: "processing", error: null, notes: "", transcript: "", minutes, file_name: fileName || null, thumbs, flashcards: null, quiz: null, scores: [], share_id: null, created_at: created || new Date().toISOString() };
   try { await LocalDB.put("media", { id: n.id, parts, text }); } catch {}
@@ -1360,16 +1372,16 @@ async function createNote({ source, subjectId = "", parts = [], text = "", fileN
   go("#/note/" + n.id);
   processNote(n.id);
 }
-function notesPrompt(n) {
+function notesPrompt(n, fromTranscript = false) {
   const s = subjectById(n.subject_id);
-  const intro = {
+  const intro = fromTranscript ? "Below is the transcript of a recording of a college class or an online meeting. If it's a meeting, cover decisions and who agreed to do what under the homework and action items heading." : {
     recording: "This audio is a recording of a college class or a meeting.",
     audio: "This audio is a recording of a college class or a meeting.",
     pdf: "This PDF is study material: lecture slides, a handout or textbook pages.",
     photo: "These photos show a whiteboard, lecture slides or textbook pages. Read every piece of text, equation and diagram carefully.",
     text: "Below are a student's rough notes or text copied from a class."
   }[n.source];
-  const isAudio = n.source === "recording" || n.source === "audio";
+  const isAudio = !fromTranscript && (n.source === "recording" || n.source === "audio");
   return `${intro}${s ? ` The subject is ${s.name}${s.code ? " (" + s.code + ")" : ""}.` : ""}
 
 Start with one line exactly like this:
@@ -1409,17 +1421,38 @@ async function processNote(id) {
   processing.add(id);
   await patchNote(n, { status: "processing", error: null }); rerender();
   try {
-    const parts = [];
-    for (const p of media.parts || []) parts.push({ inline_data: { mime_type: p.mime, data: await blobToBase64(p.blob) } });
-    parts.push({ text: notesPrompt(n) + (media.text ? "\n\nTEXT:\n" + media.text : "") });
-    const r = await callAI({ contents: [{ role: "user", parts }], maxTokens: 32000, system: "You turn class material into clear, accurate study notes for a college student." });
-    let text = r.text;
+    const audio = (media.parts || []).filter(p => p.mime.startsWith("audio/"));
+    let text, transcript = null;
+    if (audio.length > 1) {
+      // Long recording: transcribe each 15-minute part (saved as it goes, so a retry carries on where it stopped), then write notes.
+      media.transcripts ||= [];
+      for (let i = 0; i < audio.length; i++) {
+        if (media.transcripts[i] != null) continue;
+        setProgress(id, `Transcribing part ${i + 1} of ${audio.length}`, i / (audio.length + 1));
+        const r = await callAI({ task: "transcribe", maxTokens: 16000, system: "You transcribe recordings accurately and completely.",
+          contents: [{ role: "user", parts: [{ inline_data: { mime_type: audio[i].mime, data: await blobToBase64(audio[i].blob) } }, { text: transcribePrompt(i, audio.length) }] }] });
+        media.transcripts[i] = r.text.replace(/^#{1,3}\s*Transcript\s*/i, "").trim();
+        await LocalDB.put("media", media).catch(() => {});
+      }
+      transcript = media.transcripts.map((t, i) => audio.length > 1 ? `[${stamp(i * SEGMENT_MIN)}]\n${t}` : t).join("\n\n");
+      setProgress(id, "Writing your notes", audio.length / (audio.length + 1));
+      const r = await callAI({ maxTokens: 16000, system: "You turn class material into clear, accurate study notes for a college student.",
+        contents: [{ role: "user", parts: [{ text: notesPrompt(n, true) + "\n\nTRANSCRIPT:\n" + transcript.slice(0, 400000) }] }] });
+      text = r.text;
+    } else {
+      const parts = [];
+      for (const p of media.parts || []) parts.push({ inline_data: { mime_type: p.mime, data: await blobToBase64(p.blob) } });
+      parts.push({ text: notesPrompt(n) + (media.text ? "\n\nTEXT:\n" + media.text : "") });
+      setProgress(id, audio.length ? "Listening and writing notes" : "Reading and writing notes", .4);
+      const r = await callAI({ contents: [{ role: "user", parts }], maxTokens: 32000, system: "You turn class material into clear, accurate study notes for a college student." });
+      text = r.text;
+    }
     const t = text.match(/^\s*\**TITLE:?\**\s*(.+)$/im);
     if (t) text = text.replace(t[0], "").trim();
     const cut = text.search(/^#{1,3}\s*Transcript\s*$/im);
     await patchNote(n, {
       notes: (cut > -1 ? text.slice(0, cut) : text).trim(),
-      transcript: cut > -1 ? text.slice(cut).replace(/^#{1,3}\s*Transcript\s*/i, "").trim() : "",
+      transcript: transcript ?? (cut > -1 ? text.slice(cut).replace(/^#{1,3}\s*Transcript\s*/i, "").trim() : ""),
       title: (t ? t[1].replace(/[*#"]/g, "").trim() : "") || `${subjectName(n.subject_id)} class`,
       status: "ready", error: null
     });
@@ -1436,11 +1469,21 @@ async function processNote(id) {
     }
   }
   processing.delete(id);
+  delete ui.progress[id];
   rerender();
 }
+function setProgress(id, label, frac) {
+  ui.progress[id] = { label, frac };
+  if (currentRoute === "note/" + id) rerender();
+}
+const stamp = min => `${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}:00`;
+const transcribePrompt = (i, total) => `This is ${total > 1 ? `part ${i + 1} of ${total} (about ${SEGMENT_MIN} minutes each) of ` : ""}a recording of a college class or an online meeting.
+Write a complete, accurate transcript of everything that is said, in order. Remove filler words like "um" and "uh". Label speakers when you can tell them apart (Teacher, Student, Speaker 1, Speaker 2…), starting each speaker's turn on a new line. Keep it in the language spoken. Reply with the transcript only: no title, notes or comments. If nobody speaks, reply "(no speech)".`;
 
 /* ---------- Recording: mic → 16 kHz mono MP3, encoded live so long classes stay small ---------- */
-const MAX_REC_MIN = 75;
+const SEGMENT_MIN = 15;                      // long recordings are sent in 15-minute parts
+const SPLIT_OVER = 8 * 1024 * 1024;         // uploads bigger than this are split into parts first
+const canRecordMeetings = () => !!navigator.mediaDevices?.getDisplayMedia && !matchMedia("(pointer: coarse)").matches;
 const loadScript = src => new Promise((ok, fail) => { const s = document.createElement("script"); s.src = src; s.onload = ok; s.onerror = fail; document.head.append(s); });
 async function getEncoder() {
   if (!window.lamejs) { try { await loadScript("https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js"); } catch {} }
@@ -1463,40 +1506,70 @@ function setRecordingUI(on) {
   $("#recDock").hidden = !on;
   $("#chatDock").hidden = on || !onChat() || !state.user;
 }
-async function startRecording(subjectId) {
+async function startRecording(subjectId, { meeting = false } = {}) {
   if (rec) { toast("Already recording"); return; }
   if (!navigator.mediaDevices?.getUserMedia) { toast("This browser can't record audio"); return; }
-  let stream;
-  try { stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
-  catch { toast("Microphone access was blocked. Allow it in your browser settings."); return; }
+  const streams = [];
+  if (meeting) {
+    // Online meeting: capture the meeting tab's sound (everyone else's voices) plus this microphone (your voice).
+    if (!canRecordMeetings()) { toast("Recording meetings works in Chrome or Edge on a laptop. On a phone, record the class instead, or upload the meeting recording."); return; }
+    toast("Choose the meeting's tab, turn on \"Share tab audio\", then click Share");
+    let display;
+    try { display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }, systemAudio: "include", selfBrowserSurface: "exclude", surfaceSwitching: "include" }); }
+    catch { toast("Sharing was cancelled, so nothing is being recorded."); return; }
+    if (!display.getAudioTracks().length) {
+      display.getTracks().forEach(t => t.stop());
+      toast("No sound was shared. Try again, pick the meeting tab and switch on \"Share tab audio\".");
+      return;
+    }
+    streams.push(display);
+    try { streams.push(await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } })); }
+    catch { toast("Microphone blocked, so only the other people's voices will be recorded."); }
+  } else {
+    try { streams.push(await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } })); }
+    catch { toast("Microphone access was blocked. Allow it in your browser settings."); return; }
+  }
   const encoder = await getEncoder(), start = new Date();
-  rec = { stream, chunks: [], start: +start, created: start.toISOString(), encoder };
+  rec = { streams, segments: [[]], segStart: Date.now(), start: +start, created: start.toISOString(), encoder, meeting };
+  let ctx;
+  try { ctx = new AudioContext({ sampleRate: 16000 }); } catch { ctx = new AudioContext(); }
+  // Mix every audio source together.
+  const mix = ctx.createGain();
+  rec.sources = streams.filter(st => st.getAudioTracks().length).map(st => { const src = ctx.createMediaStreamSource(st); src.connect(mix); return src; });
+  Object.assign(rec, { ctx, mix });
   if (encoder) {
-    let ctx, src;
-    try { ctx = new AudioContext({ sampleRate: 16000 }); src = ctx.createMediaStreamSource(stream); }
-    catch { try { ctx?.close(); } catch {} ctx = new AudioContext(); src = ctx.createMediaStreamSource(stream); }
     const proc = ctx.createScriptProcessor(4096, 1, 1);
     let frames = 0;
     proc.onaudioprocess = e => {
+      if (!rec) return;
       const f = downsample(e.inputBuffer.getChannelData(0), ctx.sampleRate, 16000);
       const pcm = new Int16Array(f.length); let sq = 0;
       for (let i = 0; i < f.length; i++) { const v = Math.max(-1, Math.min(1, f[i])); pcm[i] = v < 0 ? v * 0x8000 : v * 0x7fff; sq += v * v; }
       const out = encoder.encodeBuffer(pcm);
-      if (out.length) rec?.chunks.push(new Uint8Array(out));
+      if (out.length) rec.segments[rec.segments.length - 1].push(new Uint8Array(out));
+      // Start a new part every 15 minutes, so long classes and meetings can be sent in pieces.
+      if (Date.now() - rec.segStart >= SEGMENT_MIN * 60000) { rec.segments.push([]); rec.segStart = Date.now(); }
       levels.push(Math.sqrt(sq / Math.max(1, f.length))); levels.shift();
       if (++frames % 2 === 0) drawBars();
     };
-    src.connect(proc); proc.connect(ctx.destination);
-    Object.assign(rec, { ctx, src, proc });
-    if (ctx.state === "suspended") await ctx.resume();
+    mix.connect(proc); proc.connect(ctx.destination);
+    rec.proc = proc;
   } else {
+    const dest = ctx.createMediaStreamDestination(); mix.connect(dest);
     const type = ["audio/ogg;codecs=opus", "audio/mp4", "audio/webm;codecs=opus", "audio/webm"].find(t => window.MediaRecorder?.isTypeSupported?.(t)) || "";
-    const mr = new MediaRecorder(stream, type ? { mimeType: type, audioBitsPerSecond: 24000 } : {});
+    const mr = new MediaRecorder(dest.stream, type ? { mimeType: type, audioBitsPerSecond: 24000 } : {});
+    rec.chunks = [];
     mr.ondataavailable = e => e.data.size && rec?.chunks.push(e.data);
     mr.start(5000); rec.mr = mr;
   }
+  if (ctx.state === "suspended") await ctx.resume();
+  // If the person clicks the browser's own "Stop sharing" button, finish the recording and make notes.
+  if (meeting) streams[0].getTracks().forEach(t => t.addEventListener("ended", () => { if (rec?.streams === streams) stopRecording(true); }));
   try { rec.wake = await navigator.wakeLock?.request("screen"); } catch {}
   $("#recSubject").innerHTML = subjectOptions(subjectId ?? subjectAt(start));
+  $("#recNote").textContent = meeting
+    ? "Recording the meeting tab and your microphone. Keep the meeting tab open. Make sure everyone knows the meeting is being recorded."
+    : "Keep this screen open until the class ends. Ask your teacher or the host before recording.";
   levels.fill(0); drawBars(); setRecordingUI(true);
   tick(); rec.timer = setInterval(tick, 500);
 }
@@ -1504,28 +1577,69 @@ function tick() {
   if (!rec) return;
   const s = Math.floor((Date.now() - rec.start) / 1000);
   $("#timer").textContent = (s >= 3600 ? Math.floor(s / 3600) + ":" : "") + String(Math.floor(s / 60) % 60).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
-  if (s >= MAX_REC_MIN * 60) { toast(`Reached ${MAX_REC_MIN} minutes, making notes now`); stopRecording(true); }
 }
 async function stopRecording(keep) {
   if (!rec) return;
   const r = rec; rec = null;
   clearInterval(r.timer);
   try { r.wake?.release(); } catch {}
-  let blob;
+  let parts = [];
   if (r.mr) {
     if (r.mr.state !== "inactive") await new Promise(ok => { r.mr.onstop = ok; r.mr.stop(); });
-    blob = new Blob(r.chunks, { type: (r.mr.mimeType || "audio/webm").split(";")[0] });
+    parts = [{ mime: (r.mr.mimeType || "audio/webm").split(";")[0], blob: new Blob(r.chunks, { type: (r.mr.mimeType || "audio/webm").split(";")[0] }) }];
   } else {
-    r.proc.disconnect(); r.src.disconnect(); r.ctx.close();
-    const tail = r.encoder.flush(); if (tail.length) r.chunks.push(new Uint8Array(tail));
-    blob = new Blob(r.chunks, { type: "audio/mpeg" });
+    r.proc.disconnect();
+    const tail = r.encoder.flush(); if (tail.length) r.segments[r.segments.length - 1].push(new Uint8Array(tail));
+    parts = r.segments.filter(seg => seg.length).map(seg => ({ mime: "audio/mpeg", blob: new Blob(seg, { type: "audio/mpeg" }) }));
   }
-  r.stream.getTracks().forEach(t => t.stop());
+  r.sources?.forEach(src => src.disconnect());
+  r.ctx.close().catch(() => {});
+  r.streams.forEach(st => st.getTracks().forEach(t => t.stop()));
   const subjectId = $("#recSubject").value;
+  const minutes = Math.max(1, Math.round((Date.now() - r.start) / 60000));
   setRecordingUI(false);
   if (!keep) { toast("Recording discarded"); return; }
-  if (blob.size < 2000) { toast("The recording was empty"); return; }
-  createNote({ source: "recording", subjectId, parts: [{ mime: blob.type, blob }], minutes: Math.max(1, Math.round((Date.now() - r.start) / 60000)), created: r.created });
+  // A tiny final part (a few seconds) is merged into nothing useful; drop it if there are others.
+  if (parts.length > 1 && parts[parts.length - 1].blob.size < 20000) parts.pop();
+  if (!parts.length || parts.reduce((t, p) => t + p.blob.size, 0) < 2000) { toast("The recording was empty"); return; }
+  if (parts.length === 1 && parts[0].blob.size > SPLIT_OVER) {
+    try { ({ parts } = await splitAudioFile(parts[0].blob, pct => toast(`Preparing your recording… ${pct}%`))); }
+    catch { toast("This recording is too long for this browser to prepare. Try Chrome, or record in shorter parts."); return; }
+  }
+  createNote({ source: "recording", subjectId, parts, minutes, created: r.created, fileName: r.meeting ? "Online meeting" : "" });
+}
+
+/* Turn any audio or video file into 15-minute, 16 kHz mono MP3 parts on this device (nothing is uploaded until it's ready). */
+async function splitAudioFile(file, onProgress) {
+  if (file.size > 600 * 1024 * 1024) throw new FriendlyError("That file is over 600 MB. Trim it, or upload just the audio.");
+  if (!(await getEncoder())) throw new FriendlyError("Couldn't load the audio converter. Check your internet connection and try again.");
+  onProgress?.(0);
+  let decoded;
+  try {
+    const ctx = new OfflineAudioContext(1, 16000, 16000);
+    decoded = await ctx.decodeAudioData(await file.arrayBuffer());
+  } catch { throw new FriendlyError("This file's audio couldn't be read here. Try MP3, M4A or MP4, or open it in Chrome."); }
+  const rate = decoded.sampleRate, total = decoded.length, per = SEGMENT_MIN * 60 * rate;
+  const chans = Array.from({ length: decoded.numberOfChannels }, (_, c) => decoded.getChannelData(c));
+  const parts = [], block = 1152 * 16;
+  for (let segStart = 0; segStart < total; segStart += per) {
+    const enc = new lamejs.Mp3Encoder(1, 16000, 24), chunks = [];
+    const end = Math.min(total, segStart + per);
+    for (let i = segStart; i < end; i += block) {
+      const n = Math.min(block, end - i), pcm = new Int16Array(n);
+      for (let k = 0; k < n; k++) {
+        let v = 0; for (const ch of chans) v += ch[i + k];
+        v = Math.max(-1, Math.min(1, v / chans.length));
+        pcm[k] = v < 0 ? v * 0x8000 : v * 0x7fff;
+      }
+      const out = enc.encodeBuffer(pcm); if (out.length) chunks.push(new Uint8Array(out));
+      if ((i / block) % 40 === 0) { onProgress?.(Math.round((i / total) * 100)); await new Promise(r => setTimeout(r, 0)); }
+    }
+    const tail = enc.flush(); if (tail.length) chunks.push(new Uint8Array(tail));
+    parts.push({ mime: "audio/mpeg", blob: new Blob(chunks, { type: "audio/mpeg" }) });
+  }
+  onProgress?.(100);
+  return { parts, minutes: Math.max(1, Math.round(total / rate / 60)) };
 }
 document.querySelectorAll("[data-record]").forEach(b => b.addEventListener("click", () => rec ? $("#stopBtn").focus() : startRecording()));
 $("#stopBtn").onclick = () => stopRecording(true);
@@ -1543,18 +1657,19 @@ function applyTheme() {
 async function openAccount() {
   $("#modelSelect").value = [...$("#modelSelect").options].some(o => o.value === state.model) ? state.model : "gemini-3.5-flash-lite";
   $("#themeSelect").value = state.theme;
-  $("#usageText").textContent = "Checking…"; $("#usageBar").style.width = "0";
+  $("#providerSelect").value = state.provider;
+  $("#usageText").textContent = "Checking…";
   $("#accountDlg").showModal();
   try {
     const row = await q(sb.from("usage").select("requests").eq("day", new Date().toISOString().slice(0, 10)).maybeSingle());
     const used = row?.requests || 0;
-    $("#usageBar").style.width = Math.min(100, used / DAILY_LIMIT * 100) + "%";
-    $("#usageText").textContent = `${used} of ${DAILY_LIMIT} used today. Resets daily.`;
+    $("#usageText").textContent = `${used} request${used === 1 ? "" : "s"} today. No daily limit.`;
   } catch { $("#usageText").textContent = "Couldn't check right now."; }
 }
 document.querySelectorAll("[data-account]").forEach(b => b.addEventListener("click", openAccount));
 $("#accountForm").addEventListener("submit", () => {
   state.model = $("#modelSelect").value; prefs.set("model", state.model);
+  state.provider = $("#providerSelect").value; prefs.set("provider", state.provider);
   state.theme = $("#themeSelect").value; prefs.set("theme", state.theme); applyTheme();
 });
 $("#signOutBtn").onclick = async () => {

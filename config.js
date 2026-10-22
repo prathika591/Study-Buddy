@@ -4,6 +4,5 @@
 window.STUDY_BUDDY_CONFIG = {
   supabaseUrl: "https://nxwjdpzlczbwgxygzjkh.supabase.co",
   supabaseAnonKey: "sb_publishable_08KcnA8fb4nR8bgiun2CJA_a5QwKZDp",
-  dailyLimit: 200,          // keep the same as DAILY_LIMIT on the server
   googleSignIn: false       // set to true after you turn on Google in Supabase (optional)
 };
