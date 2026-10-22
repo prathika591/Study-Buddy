@@ -632,7 +632,7 @@ function setAccountUI() {
    6. Sign in, setup and shared notes (pages shown outside the app)
    ===================================================================== */
 let authMsg = "";
-const APP_VERSION = "16";
+const APP_VERSION = "17";
 const authErr = e => {
   const m = e?.message || "";
   if (/invalid login credentials/i.test(m)) return "Wrong email or password. Try again, or tap Forgot password.";
@@ -1400,7 +1400,11 @@ view.addEventListener("keydown", e => { if ((e.key === "Enter" || e.key === " ")
    11. Adding notes: recordings, audio files, photos, PDFs and text
    ===================================================================== */
 let pendingSubject = "";
-function openAdd(preset) {
+function openAdd(preset, mode = "") {
+  // The red record button shows only the recording choices; "Add notes" shows everything.
+  $("#addDlg").classList.toggle("rec-mode", mode === "record");
+  $("#addTitle").textContent = mode === "record" ? "Record or upload" : "Add notes";
+  $("#addIntro").textContent = mode === "record" ? "Record a class or an online meeting, or upload one you recorded earlier. You'll get a transcript and notes." : "Filed under the class on your timetable right now. Change it if needed.";
   if (!canRecordMeetings()) $("#meetingOption small").textContent = "Works on a laptop in Chrome or Edge. On a phone, upload the meeting recording";
   pendingSubject = preset !== undefined && preset !== null ? preset : subjectAt(new Date());
   $("#addSubject").innerHTML = subjectOptions(pendingSubject);
@@ -1740,7 +1744,7 @@ async function splitAudioFile(file, onProgress) {
   onProgress?.(100);
   return { parts, minutes: Math.max(1, Math.round(total / rate / 60)) };
 }
-document.querySelectorAll("[data-record]").forEach(b => b.addEventListener("click", () => rec ? $("#stopBtn").focus() : startRecording()));
+document.querySelectorAll("[data-record]").forEach(b => b.addEventListener("click", () => rec ? $("#stopBtn").focus() : openAdd(null, "record")));
 $("#stopBtn").onclick = () => stopRecording(true);
 $("#cancelBtn").onclick = () => { if (confirm("Discard this recording?")) stopRecording(false); };
 window.addEventListener("beforeunload", e => { if (rec || processing.size) { e.preventDefault(); e.returnValue = ""; } });
