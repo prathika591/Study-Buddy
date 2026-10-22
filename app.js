@@ -44,7 +44,8 @@ const ICONS = {
   check: '<path d="M20 6L9 17l-5-5"/>',
   cards: '<rect x="2" y="6" width="15" height="14" rx="2"/><path d="M7 2h13a2 2 0 0 1 2 2v12"/>',
   download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',
-  mail: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M22 6l-10 7L2 6"/>'
+  mail: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M22 6l-10 7L2 6"/>',
+  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>'
 };
 /* Animated logo: the Study Buddy compass. Moods: "float" (gentle sway), "thinking" (slow spin), "done". */
 const COMPASS = (() => {
@@ -631,53 +632,155 @@ function setAccountUI() {
    6. Sign in, setup and shared notes (pages shown outside the app)
    ===================================================================== */
 let authMsg = "";
-function renderSignIn(stage = "form", email = "") {
+const APP_VERSION = "15";
+const authErr = e => {
+  const m = e?.message || "";
+  if (/invalid login credentials/i.test(m)) return "Wrong email or password. Try again, or tap Forgot password.";
+  if (/rate|seconds|too many/i.test(m)) return "Too many attempts. Wait a minute and try again.";
+  if (/expired|invalid.*(otp|token)|token.*(expired|invalid)/i.test(m)) return "That code is wrong or has expired. Check it, or send a new one.";
+  if (/password.*(at least|short|characters)|weak/i.test(m)) return "Use a longer password: at least 8 characters, with letters and numbers.";
+  if (/already registered|already exists/i.test(m)) return "You already have an account with this email. Sign in instead.";
+  if (/network|fetch/i.test(m)) return "No internet connection. Check it and try again.";
+  return m || "Something went wrong. Try again.";
+};
+const eyeBtn = id => `<button type="button" class="pw-eye" data-eye="${id}" aria-label="Show password">${svg("eye")}</button>`;
+// stage: signin | signup | verify (new account code) | forgot | reset (code + new password) | code (sign in with a code instead)
+function renderSignIn(stage = "signin", email = "") {
   const features = [
-    ["recording", "Record a lecture and get clean notes, homework and a transcript", "var(--rec)"],
+    ["recording", "Record a class or meeting and get notes, homework and a transcript", "var(--rec)"],
     ["cards", "Flashcards and quizzes from every class", "var(--accent)"],
     ["globe", "Ask anything, including today's news, with sources", "var(--sky)"]
   ];
+  const quick = ui.authShown ? " quick" : ""; ui.authShown = true;
+  const err = authMsg ? `<p class="err" style="margin:0 0 12px">${esc(authMsg)}</p>` : "";
+  const emailField = (auto = "username") => `<label for="email">Email</label>
+        <input id="email" type="email" required autocomplete="${auto}" placeholder="you@example.com" value="${esc(email)}">`;
+  const chip = `<div class="email-chip">${svg("mail")}<span>${esc(email)}</span><a href="#" data-stage="signin">Change</a></div>`;
+  const codeField = `<label for="code">6-digit code</label>
+        <input id="code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" maxlength="10" required pattern="[0-9 ]{6,10}" class="code-input">`;
+  const forms = {
+    signin: `<h1>${words("Welcome")} <span class="w hl" style="--i:1">back.</span></h1>
+      <p class="lead">Sign in to see your classes, notes and chats on any device.</p>
+      <form class="auth-form${quick}" id="authForm" data-step="signin">${err}
+        ${emailField()}
+        <label for="password">Password</label>
+        <div class="pw-wrap"><input id="password" type="password" required autocomplete="current-password" placeholder="Your password">${eyeBtn("password")}</div>
+        <div class="auth-row"><a href="#" data-stage="forgot">Forgot password?</a><a href="#" data-stage="code">Sign in with a code</a></div>
+        <button class="btn primary block" type="submit">Sign in</button>
+        <div class="or">New to Study Buddy?</div>
+        <button class="btn block" type="button" data-stage="signup">Create an account</button>
+      </form>`,
+    signup: `<h1>${words("Create your")} <span class="w hl" style="--i:2">account.</span></h1>
+      <p class="lead">It's free. Your notes sync to every device you sign in on.</p>
+      <ul class="feature-list">${features.map(([i, t, c], n) => `<li style="--i:${n}"><span class="ico" style="--tint:${c}">${svg(i)}</span><span>${t}</span></li>`).join("")}</ul>
+      <form class="auth-form${quick}" id="authForm" data-step="signup">${err}
+        ${emailField("email")}
+        <label for="password">Create a password</label>
+        <div class="pw-wrap"><input id="password" type="password" required minlength="8" autocomplete="new-password" placeholder="At least 8 characters">${eyeBtn("password")}</div>
+        <button class="btn primary block" type="submit">Create account</button>
+        <div class="or">Already have an account?</div>
+        <button class="btn block" type="button" data-stage="signin">Sign in</button>
+      </form>`,
+    verify: `<h1>Check your <span class="hl">email</span>.</h1>
+      <p class="lead">We sent a 6-digit code to confirm it's you. It can take a minute, and might land in spam.</p>
+      <form class="auth-form${quick}" id="authForm" data-step="verify">${err}${chip}
+        ${codeField}
+        <button class="btn primary block" type="submit">Confirm and continue</button>
+        <div class="auth-row center"><a href="#" id="resend">Send a new code</a></div>
+      </form>`,
+    forgot: `<h1>Reset your <span class="hl">password</span>.</h1>
+      <p class="lead">Enter your email and we'll send you a 6-digit code. If you used sign-in links before, do this once to set a password.</p>
+      <form class="auth-form${quick}" id="authForm" data-step="forgot">${err}
+        ${emailField()}
+        <button class="btn primary block" type="submit">Send code</button>
+        <div class="auth-row center"><a href="#" data-stage="signin">Back to sign in</a></div>
+      </form>`,
+    reset: `<h1>Choose a new <span class="hl">password</span>.</h1>
+      <p class="lead">Enter the 6-digit code we emailed you, then pick a new password.</p>
+      <form class="auth-form${quick}" id="authForm" data-step="reset">${err}${chip}
+        ${codeField}
+        <label for="password">New password</label>
+        <div class="pw-wrap"><input id="password" type="password" required minlength="8" autocomplete="new-password" placeholder="At least 8 characters">${eyeBtn("password")}</div>
+        <button class="btn primary block" type="submit">Save and sign in</button>
+        <div class="auth-row center"><a href="#" id="resend">Send a new code</a></div>
+      </form>`,
+    code: `<h1>Sign in with a <span class="hl">code</span>.</h1>
+      <p class="lead">No password? We'll email you a 6-digit code instead.</p>
+      <form class="auth-form${quick}" id="authForm" data-step="code">${err}
+        ${email && ui.codeSent ? chip + codeField : emailField()}
+        <button class="btn primary block" type="submit">${email && ui.codeSent ? "Sign in" : "Send code"}</button>
+        <div class="auth-row center">${email && ui.codeSent ? `<a href="#" id="resend">Send a new code</a>` : `<a href="#" data-stage="signin">Back to sign in</a>`}</div>
+      </form>`
+  };
   showOutside(`<div class="auth"><div class="auth-card">
     <div class="auth-brand">${mark("float")}Study Buddy</div>
-    ${stage === "form" ? `
-      <h1>${words("Your classes,")} <span class="w hl" style="--i:2">sorted.</span></h1>
-      <p class="lead">Find your focus, reach your goals. Every lecture filed under the right subject, ready to revise.</p>
-      <ul class="feature-list">${features.map(([i, t, c], n) => `<li style="--i:${n}"><span class="ico" style="--tint:${c}">${svg(i)}</span><span>${t}</span></li>`).join("")}</ul>
-      <form class="auth-form" id="signInForm">
-        ${authMsg ? `<p class="err" style="margin:0 0 12px">${esc(authMsg)}</p>` : ""}
-        <label for="email">Email</label>
-        <input id="email" type="email" required autocomplete="email" placeholder="you@example.com" value="${esc(email)}">
-        <button class="btn primary block" type="submit">${svg("mail")}Email me a sign-in link</button>
-        ${CFG.googleSignIn ? `<div class="or">or</div><button class="btn block" type="button" id="googleBtn">Continue with Google</button>` : ""}
-      </form>
-      <p class="auth-note">No password needed. Your notes sync to every device you sign in on.</p>`
-    : `
-      <h1>Check your <span class="hl">inbox</span>.</h1>
-      <p class="lead">We sent a sign-in link to <b>${esc(email)}</b>. Open it on this device to continue. It can take a minute, and might land in spam.</p>
-      <form class="auth-form" id="codeForm">
-        <label for="code">Or enter the code from the email</label>
-        <input id="code" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" maxlength="10">
-        <button class="btn primary block" type="submit">Sign in with code</button>
-      </form>
-      <p class="auth-note"><a href="#" id="changeEmail">Use a different email</a></p>`}
+    ${forms[stage] || forms.signin}
+    <p class="auth-note">Version ${APP_VERSION}</p>
   </div></div>`);
   authMsg = "";
-  $("#signInForm")?.addEventListener("submit", async e => {
+  const form = $("#authForm");
+  setTimeout(() => (form.querySelector("#email:placeholder-shown, #code, #password") || form.querySelector("input"))?.focus(), 50);
+  document.querySelectorAll(".auth [data-stage]").forEach(a => a.addEventListener("click", e => {
+    e.preventDefault(); ui.codeSent = false;
+    renderSignIn(a.dataset.stage, $("#email")?.value.trim() || email);
+  }));
+  document.querySelectorAll("[data-eye]").forEach(b => b.addEventListener("click", () => {
+    const i = $("#" + b.dataset.eye); i.type = i.type === "password" ? "text" : "password";
+    b.setAttribute("aria-label", i.type === "password" ? "Show password" : "Hide password"); i.focus();
+  }));
+  $("#resend")?.addEventListener("click", async e => {
     e.preventDefault();
-    const addr = $("#email").value.trim(), btn = e.target.querySelector("button[type=submit]");
-    btn.disabled = true; btn.textContent = "Sending…";
-    const { error } = await sb.auth.signInWithOtp({ email: addr, options: { emailRedirectTo: location.origin + location.pathname, shouldCreateUser: true } });
-    if (error) { authMsg = /rate|seconds/i.test(error.message) ? "Too many attempts. Wait a minute and try again." : error.message; renderSignIn("form", addr); return; }
-    renderSignIn("sent", addr);
+    const { error } = stage === "verify" ? await sb.auth.resend({ type: "signup", email })
+      : stage === "reset" ? await sb.auth.resetPasswordForEmail(email)
+      : await sb.auth.signInWithOtp({ email, options: { shouldCreateUser: false } });
+    toast(error ? authErr(error) : "New code sent. Check your email.");
   });
-  $("#googleBtn")?.addEventListener("click", () => sb.auth.signInWithOAuth({ provider: "google", options: { redirectTo: location.origin + location.pathname } }));
-  $("#codeForm")?.addEventListener("submit", async e => {
+  form.addEventListener("submit", async e => {
     e.preventDefault();
-    const token = $("#code").value.replace(/\s/g, "");
-    const { error } = await sb.auth.verifyOtp({ email, token, type: "email" });
-    if (error) toast("That code didn't work. Check it or use the link instead.");
+    const btn = form.querySelector("button[type=submit]"), label = btn.textContent;
+    const addr = ($("#email")?.value.trim() || email).toLowerCase(), pw = $("#password")?.value || "", code = ($("#code")?.value || "").replace(/\D/g, "");
+    btn.disabled = true; btn.textContent = "Please wait…";
+    const fail = (err, next = stage, mail = addr) => { authMsg = authErr(err); renderSignIn(next, mail); };
+    try {
+      if (stage === "signin") {
+        const { error } = await sb.auth.signInWithPassword({ email: addr, password: pw });
+        if (error && /not confirmed/i.test(error.message)) { await sb.auth.resend({ type: "signup", email: addr }); authMsg = "Confirm your email first. We've sent you a new code."; renderSignIn("verify", addr); return; }
+        if (error) return fail(error);
+      } else if (stage === "signup") {
+        if (pw.length < 8) return fail({ message: "password at least" });
+        const { data, error } = await sb.auth.signUp({ email: addr, password: pw });
+        if (error) return fail(error);
+        if (data?.user && Array.isArray(data.user.identities) && !data.user.identities.length) return fail({ message: "already registered" }, "signin");
+        if (!data?.session) renderSignIn("verify", addr);
+      } else if (stage === "verify") {
+        const { error } = await sb.auth.verifyOtp({ email: addr, token: code, type: "signup" });
+        if (error) return fail(error);
+      } else if (stage === "forgot") {
+        const { error } = await sb.auth.resetPasswordForEmail(addr);
+        if (error) return fail(error);
+        renderSignIn("reset", addr);
+      } else if (stage === "reset") {
+        if (pw.length < 8) return fail({ message: "password at least" });
+        const v = await sb.auth.verifyOtp({ email: addr, token: code, type: "recovery" });
+        if (v.error) return fail(v.error);
+        const { error } = await sb.auth.updateUser({ password: pw });
+        if (error) return fail(error);
+        toast("Password saved. You're signed in.");
+      } else if (stage === "code") {
+        if (!ui.codeSent) {
+          const { error } = await sb.auth.signInWithOtp({ email: addr, options: { shouldCreateUser: false } });
+          if (error && /signups not allowed|not found/i.test(error.message)) return fail({ message: "No account uses this email yet. Create one first." }, "signup");
+          if (error) return fail(error);
+          ui.codeSent = true; renderSignIn("code", addr);
+        } else {
+          const { error } = await sb.auth.verifyOtp({ email: addr, token: code, type: "email" });
+          if (error) return fail(error);
+          ui.codeSent = false;
+        }
+      }
+    } catch (err) { fail(err); }
+    finally { if (btn.isConnected) { btn.disabled = false; btn.textContent = label; } }
   });
-  $("#changeEmail")?.addEventListener("click", e => { e.preventDefault(); renderSignIn("form", email); });
 }
 function renderSetup() {
   showOutside(`<div class="auth"><div class="auth-card">
@@ -1659,6 +1762,7 @@ async function openAccount() {
   $("#themeSelect").value = state.theme;
   $("#providerSelect").value = state.provider;
   $("#usageText").textContent = "Checking…";
+  $("#appVersion").textContent = APP_VERSION;
   $("#accountDlg").showModal();
   try {
     const row = await q(sb.from("usage").select("requests").eq("day", new Date().toISOString().slice(0, 10)).maybeSingle());
