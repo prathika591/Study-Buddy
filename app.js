@@ -1302,7 +1302,7 @@ view.addEventListener("keydown", e => { if ((e.key === "Enter" || e.key === " ")
    ===================================================================== */
 let pendingSubject = "";
 function openAdd(preset) {
-  $("#meetingOption").hidden = !canRecordMeetings();
+  if (!canRecordMeetings()) $("#meetingOption small").textContent = "Works on a laptop in Chrome or Edge. On a phone, upload the meeting recording";
   pendingSubject = preset !== undefined && preset !== null ? preset : subjectAt(new Date());
   $("#addSubject").innerHTML = subjectOptions(pendingSubject);
   $("#addDlg").showModal();
@@ -1771,7 +1771,12 @@ function onSignedOut() {
   matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", applyTheme);
   await LocalDB.open().catch(() => {});
   navigator.storage?.persist?.().catch(() => {});
-  if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
+  if ("serviceWorker" in navigator && location.protocol === "https:") {
+    // When a new version is published, switch to it straight away (unless a recording is running).
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener("controllerchange", () => { if (hadController && !rec) location.reload(); });
+    navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).then(r => { r.update().catch(() => {}); document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && r.update().catch(() => {})); }).catch(() => {});
+  }
   if (!sb) { route(); return; }
   const hp = new URLSearchParams(location.hash.replace(/^#\/?/, ""));
   if (hp.get("error_description")) { authMsg = hp.get("error_description").replace(/\+/g, " ") + ". Request a new link."; history.replaceState(null, "", location.pathname); }
