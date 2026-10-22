@@ -632,7 +632,7 @@ function setAccountUI() {
    6. Sign in, setup and shared notes (pages shown outside the app)
    ===================================================================== */
 let authMsg = "";
-const APP_VERSION = "17";
+const APP_VERSION = "18";
 const authErr = e => {
   const m = e?.message || "";
   if (/invalid login credentials/i.test(m)) return "Wrong email or password. Try again, or tap Forgot password.";
@@ -1712,37 +1712,235 @@ async function stopRecording(keep) {
   createNote({ source: "recording", subjectId, parts, minutes, created: r.created, fileName: r.meeting ? "Online meeting" : "" });
 }
 
-/* Turn any audio or video file into 15-minute, 16 kHz mono MP3 parts on this device (nothing is uploaded until it's ready). */
+/* Turn any audio or video file, of any size, into 15-minute, 16 kHz mono MP3 parts on this device.
+   Big files are read a few MB at a time and only the sound is kept, so even a 2 GB video works,
+   and the app never stores a copy of the video itself. Nothing is uploaded until the parts are ready. */
 async function splitAudioFile(file, onProgress) {
-  if (file.size > 600 * 1024 * 1024) throw new FriendlyError("That file is over 600 MB. Trim it, or upload just the audio.");
   if (!(await getEncoder())) throw new FriendlyError("Couldn't load the audio converter. Check your internet connection and try again.");
   onProgress?.(0);
-  let decoded;
-  try {
-    const ctx = new OfflineAudioContext(1, 16000, 16000);
-    decoded = await ctx.decodeAudioData(await file.arrayBuffer());
-  } catch { throw new FriendlyError("This file's audio couldn't be read here. Try MP3, M4A or MP4, or open it in Chrome."); }
-  const rate = decoded.sampleRate, total = decoded.length, per = SEGMENT_MIN * 60 * rate;
-  const chans = Array.from({ length: decoded.numberOfChannels }, (_, c) => decoded.getChannelData(c));
-  const parts = [], block = 1152 * 16;
-  for (let segStart = 0; segStart < total; segStart += per) {
-    const enc = new lamejs.Mp3Encoder(1, 16000, 24), chunks = [];
-    const end = Math.min(total, segStart + per);
-    for (let i = segStart; i < end; i += block) {
-      const n = Math.min(block, end - i), pcm = new Int16Array(n);
-      for (let k = 0; k < n; k++) {
-        let v = 0; for (const ch of chans) v += ch[i + k];
-        v = Math.max(-1, Math.min(1, v / chans.length));
-        pcm[k] = v < 0 ? v * 0x8000 : v * 0x7fff;
-      }
-      const out = enc.encodeBuffer(pcm); if (out.length) chunks.push(new Uint8Array(out));
-      if ((i / block) % 40 === 0) { onProgress?.(Math.round((i / total) * 100)); await new Promise(r => setTimeout(r, 0)); }
-    }
-    const tail = enc.flush(); if (tail.length) chunks.push(new Uint8Array(tail));
+  if (window.AudioDecoder) {
+    try { const r = await streamMp4Audio(file, onProgress); if (r) return r; }
+    catch (e) { if (e instanceof FriendlyError) throw e; console.warn("Streaming read failed, trying another way", e); }
+  }
+  if (file.size <= 300 * 1024 * 1024) {
+    try { return await decodeWholeFile(file, onProgress); } catch (e) { if (file.size < 50 * 1024 * 1024) throw e; }
+  }
+  return captureByPlaying(file, onProgress);
+}
+const tick0 = () => new Promise(r => setTimeout(r, 0));
+
+// Collects 16 kHz mono sound and cuts it into 15-minute MP3 parts (about 2.7 MB each).
+function makeSegmenter() {
+  const per = SEGMENT_MIN * 60 * 16000, parts = [];
+  let enc = null, chunks = [], count = 0, total = 0;
+  const close = () => {
+    if (!enc) return;
+    const t = enc.flush(); if (t.length) chunks.push(new Uint8Array(t));
     parts.push({ mime: "audio/mpeg", blob: new Blob(chunks, { type: "audio/mpeg" }) });
+    enc = null; chunks = []; count = 0;
+  };
+  return {
+    push(f) {
+      for (let i = 0; i < f.length;) {
+        enc ||= new lamejs.Mp3Encoder(1, 16000, 24);
+        const n = Math.min(f.length - i, per - count), pcm = new Int16Array(n);
+        for (let k = 0; k < n; k++) { const v = Math.max(-1, Math.min(1, f[i + k])); pcm[k] = v < 0 ? v * 0x8000 : v * 0x7fff; }
+        const out = enc.encodeBuffer(pcm); if (out.length) chunks.push(new Uint8Array(out));
+        count += n; total += n; i += n;
+        if (count >= per) close();
+      }
+    },
+    finish() {
+      close();
+      if (!parts.length || total < 16000) throw new FriendlyError("No sound was found in that file.");
+      return { parts, minutes: Math.max(1, Math.round(total / 16000 / 60)) };
+    }
+  };
+}
+// Streaming resampler from any rate to 16 kHz (averages when shrinking, so speech stays clear).
+function makeResampler(rate) {
+  const step = rate / 16000;
+  if (step < 1) { let t = 0; return f => { const out = []; for (const v of f) { t += 1 / step; while (t >= 1) { out.push(v); t--; } } return Float32Array.from(out); }; }
+  let acc = 0, n = 0, need = step;
+  return f => {
+    const out = new Float32Array(Math.ceil(f.length / step) + 2); let o = 0;
+    for (let i = 0; i < f.length; i++) { acc += f[i]; n++; if (n >= need) { out[o++] = acc / n; acc = 0; need += step - n; n = 0; } }
+    return out.subarray(0, o);
+  };
+}
+
+// Smaller files: decode everything at once (works for almost any format the browser can play).
+async function decodeWholeFile(file, onProgress) {
+  let decoded;
+  try { decoded = await new OfflineAudioContext(1, 16000, 16000).decodeAudioData(await file.arrayBuffer()); }
+  catch { throw new FriendlyError("This file's audio couldn't be read here. Try MP3, M4A or MP4, or open it in Chrome."); }
+  const seg = makeSegmenter(), chans = Array.from({ length: decoded.numberOfChannels }, (_, c) => decoded.getChannelData(c));
+  const total = decoded.length, block = 16000 * 30;
+  for (let i = 0; i < total; i += block) {
+    const n = Math.min(block, total - i), mono = new Float32Array(n);
+    for (const ch of chans) for (let k = 0; k < n; k++) mono[k] += ch[i + k] / chans.length;
+    seg.push(mono);
+    onProgress?.(Math.round(i / total * 100)); await tick0();
   }
   onProgress?.(100);
-  return { parts, minutes: Math.max(1, Math.round(total / rate / 60)) };
+  return seg.finish();
+}
+
+// MP4 / MOV / M4A of any size: find the sound track, read it in pieces and decode it with the browser's own decoder.
+async function streamMp4Audio(file, onProgress) {
+  if (file.size < 16) return null;
+  const head = new Uint8Array(await file.slice(4, 8).arrayBuffer());
+  if (String.fromCharCode(...head) !== "ftyp") return null;
+  const t = await findMp4AudioTrack(file);
+  if (!t) return null;
+  const config = { codec: t.codec, sampleRate: t.sampleRate, numberOfChannels: t.channels, ...(t.description ? { description: t.description } : {}) };
+  if (!(await AudioDecoder.isConfigSupported(config).catch(() => ({}))).supported) return null;
+  const seg = makeSegmenter();
+  let resample = null, rate = 0, failure = null;
+  const dec = new AudioDecoder({
+    output: data => {
+      try {
+        if (data.sampleRate !== rate) { rate = data.sampleRate; resample = makeResampler(rate); }
+        const n = data.numberOfFrames, ch = data.numberOfChannels, mono = new Float32Array(n), tmp = new Float32Array(n);
+        for (let c = 0; c < ch; c++) { data.copyTo(tmp, { planeIndex: c, format: "f32-planar" }); for (let i = 0; i < n; i++) mono[i] += tmp[i] / ch; }
+        seg.push(resample(mono));
+      } catch (e) { failure = e; } finally { data.close(); }
+    },
+    error: e => { failure = e; }
+  });
+  dec.configure(config);
+  const { offsets, sizes } = t, N = sizes.length, WIN = 4 * 1024 * 1024;
+  let last = -1;
+  for (let i = 0; i < N;) {
+    const start = offsets[i]; let j = i, end = start + sizes[i];
+    while (j < N && offsets[j] >= start && offsets[j] + sizes[j] - start <= WIN) { end = Math.max(end, offsets[j] + sizes[j]); j++; }
+    if (j === i) j = i + 1;
+    const buf = new Uint8Array(await file.slice(start, end).arrayBuffer());
+    for (let k = i; k < j; k++) {
+      const a = offsets[k] - start;
+      dec.decode(new EncodedAudioChunk({ type: "key", timestamp: Math.round(k * t.frameUs), data: buf.subarray(a, a + sizes[k]) }));
+    }
+    i = j;
+    while (dec.decodeQueueSize > 40 && !failure) await new Promise(r => setTimeout(r, 4));
+    if (failure) throw failure;
+    const pct = Math.round(i / N * 100); if (pct !== last) { last = pct; onProgress?.(pct); }
+    await tick0();
+  }
+  await dec.flush(); dec.close();
+  if (failure) throw failure;
+  onProgress?.(100);
+  return seg.finish();
+}
+
+// Reads just the MP4 index (the "moov" box) to find where every piece of sound sits in the file.
+async function findMp4AudioTrack(file) {
+  let pos = 0, moov = null;
+  while (pos + 8 <= file.size) {
+    const dv = new DataView(await file.slice(pos, pos + 16).arrayBuffer());
+    let size = dv.getUint32(0), hdr = 8;
+    const type = String.fromCharCode(dv.getUint8(4), dv.getUint8(5), dv.getUint8(6), dv.getUint8(7));
+    if (size === 1) { size = dv.getUint32(8) * 4294967296 + dv.getUint32(12); hdr = 16; }
+    else if (size === 0) size = file.size - pos;
+    if (size < hdr) return null;
+    if (type === "moov") { moov = [pos + hdr, pos + size]; break; }
+    pos += size;
+  }
+  if (!moov || moov[1] - moov[0] > 200 * 1024 * 1024) return null;
+  const dv = new DataView(await file.slice(moov[0], moov[1]).arrayBuffer());
+  const u8 = new Uint8Array(dv.buffer);
+  const fourcc = p => String.fromCharCode(u8[p], u8[p + 1], u8[p + 2], u8[p + 3]);
+  const kids = (s, e) => {
+    const out = [];
+    while (s + 8 <= e) {
+      let size = dv.getUint32(s), h = 8;
+      if (size === 1) { size = dv.getUint32(s + 8) * 4294967296 + dv.getUint32(s + 12); h = 16; } else if (size === 0) size = e - s;
+      if (size < h || s + size > e) break;
+      out.push({ type: fourcc(s + 4), s: s + h, e: s + size }); s += size;
+    }
+    return out;
+  };
+  const child = (box, ...path) => { for (const p of path) box = box && kids(box.s, box.e).find(b => b.type === p); return box; };
+  const findDeep = (s, e, type, depth = 0) => {
+    for (const b of kids(s, e)) { if (b.type === type) return b; if (depth < 3) { const r = findDeep(b.s, b.e, type, depth + 1); if (r) return r; } }
+    return null;
+  };
+  for (const trak of kids(0, u8.length).filter(b => b.type === "trak")) {
+    const hdlr = child(trak, "mdia", "hdlr");
+    if (!hdlr || fourcc(hdlr.s + 8) !== "soun") continue;
+    const mdhd = child(trak, "mdia", "mdhd"), stbl = child(trak, "mdia", "minf", "stbl");
+    if (!stbl) continue;
+    const stsd = child(stbl, "stsd"), stsz = child(stbl, "stsz"), stsc = child(stbl, "stsc"), stts = child(stbl, "stts");
+    const stco = child(stbl, "stco"), co64 = child(stbl, "co64"), chunks = stco || co64;
+    if (!stsd || !stsz || !stsc || !chunks) continue;
+    // Sample description: codec, channels, sample rate
+    const es = stsd.s + 8, fmt = fourcc(es + 4), ver = dv.getUint16(es + 16);
+    let channels = dv.getUint16(es + 24), sampleRate = dv.getUint32(es + 32) >>> 16;
+    if (ver === 2) { sampleRate = Math.round(dv.getFloat64(es + 40)); channels = dv.getUint32(es + 48); }
+    const kidsStart = es + (ver === 1 ? 52 : ver === 2 ? 72 : 36), esEnd = es + dv.getUint32(es);
+    let codec = null, description = null;
+    if (fmt === "mp4a") {
+      const esds = findDeep(kidsStart, esEnd, "esds");
+      if (!esds) continue;
+      let p = esds.s + 4;
+      const desc = () => { const tag = u8[p++]; let len = 0; for (let i = 0; i < 4; i++) { const b = u8[p++]; len = (len << 7) | (b & 0x7f); if (!(b & 0x80)) break; } return { tag, len }; };
+      let d = desc(); if (d.tag !== 3) continue;
+      p += 2; const flags = u8[p++]; if (flags & 0x80) p += 2; if (flags & 0x40) p += u8[p] + 1; if (flags & 0x20) p += 2;
+      d = desc(); if (d.tag !== 4) continue;
+      const oti = u8[p]; p += 13;
+      if (oti === 0x6b || oti === 0x69) codec = "mp3";
+      else {
+        d = desc(); if (d.tag !== 5) continue;
+        description = u8.slice(p, p + d.len);
+        let aot = description[0] >> 3; if (aot === 31) aot = 32 + (((description[0] & 7) << 3) | (description[1] >> 5));
+        codec = "mp4a.40." + aot;
+      }
+    } else if (fmt === "Opus") codec = "opus";
+    else if (fmt === ".mp3") codec = "mp3";
+    else return null;
+    // Where each sample is: sizes (stsz), chunk offsets (stco/co64), samples per chunk (stsc)
+    const fixed = dv.getUint32(stsz.s + 4), count = dv.getUint32(stsz.s + 8);
+    const sizes = new Uint32Array(count);
+    for (let i = 0; i < count; i++) sizes[i] = fixed || dv.getUint32(stsz.s + 12 + i * 4);
+    const big = !stco, nChunks = dv.getUint32(chunks.s + 4);
+    const chunkOff = i => big ? dv.getUint32(chunks.s + 8 + i * 8) * 4294967296 + dv.getUint32(chunks.s + 12 + i * 8) : dv.getUint32(chunks.s + 8 + i * 4);
+    const runs = dv.getUint32(stsc.s + 4), offsets = new Float64Array(count);
+    let k = 0;
+    for (let r = 0; r < runs && k < count; r++) {
+      const first = dv.getUint32(stsc.s + 8 + r * 12) - 1, per = dv.getUint32(stsc.s + 12 + r * 12);
+      const next = r + 1 < runs ? dv.getUint32(stsc.s + 8 + (r + 1) * 12) - 1 : nChunks;
+      for (let c = first; c < next && k < count; c++) { let off = chunkOff(c); for (let q = 0; q < per && k < count; q++) { offsets[k] = off; off += sizes[k]; k++; } }
+    }
+    if (!count || k < count) return null;
+    const timescale = mdhd ? dv.getUint32(mdhd.s + (u8[mdhd.s] === 1 ? 20 : 12)) : sampleRate;
+    const delta = stts && dv.getUint32(stts.s + 4) ? dv.getUint32(stts.s + 12) : 1024;
+    return { codec, description, sampleRate, channels: channels || 2, offsets, sizes, frameUs: delta / (timescale || sampleRate) * 1e6 };
+  }
+  return null;
+}
+
+// Anything else that's huge (for example MKV or WebM): play it silently and keep the sound as it plays.
+// This takes as long as the video, so it's the last resort.
+async function captureByPlaying(file, onProgress) {
+  const el = document.createElement(file.type.startsWith("audio") ? "audio" : "video");
+  el.src = URL.createObjectURL(file); el.preload = "auto"; el.playsInline = true;
+  try { await new Promise((ok, no) => { el.onloadedmetadata = ok; el.onerror = () => no(); }); }
+  catch { URL.revokeObjectURL(el.src); throw new FriendlyError("This file couldn't be opened here. Try an MP4 or MP3, or open Study Buddy in Chrome."); }
+  const mins = Math.round((el.duration || 0) / 60);
+  toast(`This kind of file can only be read by playing it, which takes about ${mins || "as many"} minutes. Keep this tab open.`);
+  const ctx = new AudioContext(), src = ctx.createMediaElementSource(el), proc = ctx.createScriptProcessor(4096, 1, 1), mute = ctx.createGain();
+  mute.gain.value = 0;
+  const seg = makeSegmenter(), resample = makeResampler(ctx.sampleRate);
+  proc.onaudioprocess = e => seg.push(resample(e.inputBuffer.getChannelData(0)));
+  src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+  await ctx.resume().catch(() => {});
+  let last = -1;
+  el.ontimeupdate = () => { const p = Math.round(el.currentTime / (el.duration || 1) * 100); if (p !== last) { last = p; onProgress?.(p); } };
+  try {
+    await el.play();
+    await new Promise((ok, no) => { el.onended = ok; el.onerror = () => no(new FriendlyError("Playback stopped partway. Try again, or use an MP4 file.")); });
+  } finally { proc.disconnect(); src.disconnect(); ctx.close().catch(() => {}); URL.revokeObjectURL(el.src); }
+  onProgress?.(100);
+  return seg.finish();
 }
 document.querySelectorAll("[data-record]").forEach(b => b.addEventListener("click", () => rec ? $("#stopBtn").focus() : openAdd(null, "record")));
 $("#stopBtn").onclick = () => stopRecording(true);
