@@ -146,6 +146,14 @@ Deno.serve(async (req) => {
       if (r) return r;
       problems.push(`${id}: no model answered`);
     } catch (e) {
+      // A damaged or locked file won't work on any service, so say so instead of "busy".
+      const name = (e as { name?: string })?.name ?? "";
+      if (/PDF|Password/i.test(name)) {
+        console.warn("unreadable PDF:", name);
+        return json({ error: "bad_file", message: /Password/i.test(name)
+          ? "That PDF is password-protected, so it can't be read. Save it as a new PDF without a password, or take photos of the pages."
+          : "That PDF is damaged or isn't a real PDF, so it can't be read. Download it again, or take photos of the pages instead." }, 422);
+      }
       console.error(`${id} failed:`, e);
       problems.push(`${id}: ${e instanceof Error ? e.message : e}`);
     }

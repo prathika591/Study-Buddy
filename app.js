@@ -632,7 +632,7 @@ function setAccountUI() {
    6. Sign in, setup and shared notes (pages shown outside the app)
    ===================================================================== */
 let authMsg = "";
-const APP_VERSION = "20";
+const APP_VERSION = "21";
 const authErr = e => {
   const m = e?.message || "";
   if (/invalid login credentials/i.test(m)) return "Wrong email or password. Try again, or tap Forgot password.";
@@ -1450,7 +1450,25 @@ $("#textForm").addEventListener("submit", e => {
   if (text.length < 20) { e.preventDefault(); toast("Add a bit more text first"); return; }
   createNote({ source: "text", subjectId: pendingSubject, text });
 });
-$("#pdfInput").onchange = e => { const f = e.target.files[0]; e.target.value = ""; if (f) createNote({ source: "pdf", subjectId: pendingSubject, parts: [{ mime: "application/pdf", blob: f }], fileName: f.name }); };
+$("#pdfInput").onchange = async e => {
+  const f = e.target.files[0]; e.target.value = ""; if (!f) return;
+  const problem = await pdfProblem(f);
+  if (problem) { toast(problem); return; }
+  createNote({ source: "pdf", subjectId: pendingSubject, parts: [{ mime: "application/pdf", blob: f }], fileName: f.name });
+};
+// Checks a PDF before it's sent, so a broken or locked file gets a clear message instead of failing on the server.
+async function pdfProblem(f) {
+  if (!f.size) return "That file is empty. Download it again and retry.";
+  const head = new TextDecoder("latin1").decode(await f.slice(0, 1024).arrayBuffer());
+  if (!head.includes("%PDF")) {
+    if (/^PK/.test(head)) return "That's a Word or PowerPoint file, not a PDF. Save it as PDF first (File → Save as → PDF), or take photos of the pages.";
+    if (/<html|<!doctype/i.test(head)) return "That file is a web page saved with a .pdf name, not a real PDF. Open the link in your browser, sign in if needed, and download it again.";
+    return "That file isn't a real PDF, so it can't be read. Download it again, or take photos of the pages instead.";
+  }
+  const tail = new TextDecoder("latin1").decode(await f.slice(Math.max(0, f.size - 4096)).arrayBuffer());
+  if (/\/Encrypt\b/.test(head + tail)) return "That PDF is password-protected, so it can't be read. Open it, print or save it as a new PDF without a password, then upload that.";
+  return "";
+}
 $("#audioInput").onchange = async e => {
   const f = e.target.files[0]; e.target.value = ""; if (!f) return;
   const ext = (f.name.split(".").pop() || "").toLowerCase();
