@@ -632,7 +632,7 @@ function setAccountUI() {
    6. Sign in, setup and shared notes (pages shown outside the app)
    ===================================================================== */
 let authMsg = "";
-const APP_VERSION = "19";
+const APP_VERSION = "20";
 const authErr = e => {
   const m = e?.message || "";
   if (/invalid login credentials/i.test(m)) return "Wrong email or password. Try again, or tap Forgot password.";
@@ -858,6 +858,21 @@ function chatHistory() {
   while (msgs.length && msgs[0].role !== "user") msgs.shift();
   return msgs.map(m => ({ role: m.role, parts: [{ text: m.text }] }));
 }
+// When every AI is busy, wait and try again on its own (5 s, 15 s, 30 s, 60 s) instead of showing an error.
+const RETRY_WAITS = [5, 15, 30, 60];
+async function callAIRetry(opts, onWait) {
+  for (let i = 0; ; i++) {
+    try { return await callAI(opts); }
+    catch (e) {
+      if (!e.busy || i >= RETRY_WAITS.length || opts.signal?.aborted) throw e;
+      for (let left = RETRY_WAITS[i]; left > 0; left--) {
+        onWait?.(left);
+        await new Promise((ok, no) => { const t = setTimeout(ok, 1000); opts.signal?.addEventListener("abort", () => { clearTimeout(t); no(new DOMException("Stopped", "AbortError")); }, { once: true }); });
+      }
+      onWait?.(0);
+    }
+  }
+}
 async function send(text) {
   text = (text || "").trim();
   if (!text || state.busy) return;
@@ -890,7 +905,8 @@ async function send(text) {
   };
   state.abort = new AbortController();
   try {
-    const r = await callAI({ contents: history, system: ctx.system, search: true, stream: true, signal: state.abort.signal, onDelta: t => { reply.text = t; if (!frame) frame = requestAnimationFrame(paint); } });
+    const r = await callAIRetry({ contents: history, system: ctx.system, search: true, stream: true, signal: state.abort.signal, onDelta: t => { reply.text = t; if (!frame) frame = requestAnimationFrame(paint); } },
+      left => { reply.text = ""; reply.pending = left ? `Busy right now, trying again in ${left} s` : "Thinking"; if (state.chatId === chatId && onChat()) renderChat(); });
     reply.text = r.text; reply.sources = r.sources; reply.backup = !!r.backup;
     if (r.stopped) reply.text += "\n\n*Stopped.*";
   } catch (e) {
@@ -1547,7 +1563,7 @@ async function translateToEnglish(text, onStep) {
   const out = []; let changed = false;
   for (let i = 0; i < pieces.length; i++) {
     onStep?.(i, pieces.length);
-    const r = await callAI({ maxTokens: 16000, system: "You are an accurate translator.", contents: [{ role: "user", parts: [{ text: translatePrompt(pieces[i]) }] }] });
+    const r = await callAIRetry({ maxTokens: 16000, system: "You are an accurate translator.", contents: [{ role: "user", parts: [{ text: translatePrompt(pieces[i]) }] }] });
     const t = r.text.trim();
     if (/^ALREADY_ENGLISH\b/.test(t)) out.push(pieces[i]); else { out.push(t); changed = true; }
   }
@@ -1568,7 +1584,7 @@ async function redoNotes(id) {
   ui.generating[id + "redo"] = true; rerender();
   try {
     const m = n.transcript.match(ORIGINAL_HEAD), src = m ? n.transcript.slice(0, m.index) : n.transcript;
-    const r = await callAI({ maxTokens: 24000, system: "You turn class material into detailed, accurate study notes in English for a college student.",
+    const r = await callAIRetry({ maxTokens: 24000, system: "You turn class material into detailed, accurate study notes in English for a college student.",
       contents: [{ role: "user", parts: [{ text: notesPrompt(n, true) + "\n\nTRANSCRIPT:\n" + src.slice(0, 400000) }] }] });
     let text = r.text; const t = text.match(/^\s*\**TITLE:?\**\s*(.+)$/im); if (t) text = text.replace(t[0], "").trim();
     const cut = text.search(/^#{1,3}\s*Transcript\s*$/im); if (cut > -1) text = text.slice(0, cut);

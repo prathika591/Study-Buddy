@@ -16,26 +16,66 @@ const list = (name: string, fallback: string[]) => (Deno.env.get(name) ?? "").sp
 
 /* The other services all speak the same "OpenAI-style" chat format, so adding one is a single entry here.
    Model lists are tried in order; retired or busy models are skipped. Each list can be overridden with a secret. */
-type Provider = { id: string; name: string; keyEnv: string; base: string; text: string[]; vision?: string[]; search?: string[]; headers?: Record<string, string> };
+type Kind = "text" | "vision" | "search";
+type Provider = { id: string; name: string; keyEnv: string; base: string; text: string[]; vision?: string[]; search?: string[]; headers?: Record<string, string>;
+  auto?: Partial<Record<Kind, RegExp>>;          // also use any newer model whose name matches, when the favourites are retired
+  filterIds?: (ids: string[]) => string[] };
 const PROVIDERS: Provider[] = [
   {
     id: "groq", name: "Groq", keyEnv: "GROQ_API_KEY", base: "https://api.groq.com/openai/v1",
     text: list("GROQ_TEXT_MODELS", ["llama-3.3-70b-versatile", "meta-llama/llama-4-scout-17b-16e-instruct", "openai/gpt-oss-120b", "llama-3.1-8b-instant"]),
     vision: list("GROQ_VISION_MODELS", ["meta-llama/llama-4-scout-17b-16e-instruct", "meta-llama/llama-4-maverick-17b-128e-instruct"]),
     search: list("GROQ_SEARCH_MODELS", ["groq/compound-mini", "groq/compound"]),
+    auto: { text: /^(?!.*(whisper|guard|tts|orpheus|playai|distil|compound|allam)).*(llama|gpt-oss|qwen|kimi|gemma|mistral|deepseek|glm)/i, vision: /(llama-4|vision|-vl\b)/i, search: /compound/i },
   },
   {
     id: "mistral", name: "Mistral", keyEnv: "MISTRAL_API_KEY", base: "https://api.mistral.ai/v1",
     text: list("MISTRAL_MODELS", ["mistral-medium-latest", "mistral-small-latest", "mistral-large-latest"]),
     vision: list("MISTRAL_VISION_MODELS", ["mistral-medium-latest", "mistral-small-latest"]),
+    auto: { text: /^(mistral-(small|medium|large)|magistral-(small|medium))-latest$/, vision: /^(mistral-(small|medium)|pixtral-large)-latest$/ },
   },
   {
     id: "openrouter", name: "OpenRouter", keyEnv: "OPENROUTER_API_KEY", base: "https://openrouter.ai/api/v1",
     text: list("OPENROUTER_MODELS", ["openrouter/free", "google/gemma-4-31b-it:free", "nvidia/nemotron-3-super-120b-a12b:free", "google/gemma-4-26b-a4b-it:free"]),
     headers: { "HTTP-Referer": "https://prathika591.github.io/Study-Buddy/", "X-Title": "Study Buddy" },
+    auto: { text: /:free$/ },
   },
 ];
 const WHISPER = list("GROQ_WHISPER_MODELS", ["whisper-large-v3-turbo", "whisper-large-v3"]);
+
+/* ---- Which models does each service offer right now? (cached for 30 minutes) ----
+   Free models get retired often, so instead of failing on a removed model the server asks the service for its
+   current list, keeps the favourites that still exist and adds newer ones that look similar. */
+const discovered = new Map<string, { at: number; ids: string[] }>();
+async function modelIds(id: string, url: string, headers: Record<string, string>, parse: (j: any) => string[]): Promise<string[] | null> {
+  const c = discovered.get(id);
+  if (c && Date.now() - c.at < 30 * 60_000) return c.ids;
+  try {
+    const r = await fetch(url, { headers, signal: AbortSignal.timeout(5000) });
+    if (r.ok) { const ids = parse(await r.json()).filter(Boolean); if (ids.length) { discovered.set(id, { at: Date.now(), ids }); return ids; } }
+    else console.warn(`${id} model list: ${r.status}`);
+  } catch (e) { console.warn(`${id} model list failed:`, e); }
+  return c?.ids ?? null;
+}
+const newestFirst = (a: string, b: string) => b.localeCompare(a, undefined, { numeric: true });
+function choose(pref: string[], ids: string[] | null, auto?: RegExp, max = 6): string[] {
+  if (!ids) return [...new Set(pref)];
+  const have = new Set(ids), ok = [...new Set(pref)].filter((m) => have.has(m));
+  const extra = auto ? ids.filter((m) => auto.test(m) && !ok.includes(m)).sort(newestFirst) : [];
+  return [...ok, ...extra].slice(0, max);
+}
+async function providerModels(p: Provider, kind: Kind): Promise<string[]> {
+  const pref = p[kind] ?? [];
+  if (!p.auto?.[kind] && !pref.length) return [];
+  const ids = await modelIds(p.id, p.base + "/models", { Authorization: "Bearer " + Deno.env.get(p.keyEnv), ...(p.headers ?? {}) }, (j) => (j?.data ?? []).map((m: { id: string }) => m.id));
+  return choose(pref, ids, p.auto?.[kind]);
+}
+async function geminiModels(key: string, preferred?: string): Promise<string[]> {
+  const ids = await modelIds("gemini", GEMINI_API + "?pageSize=200", { "x-goog-api-key": key }, (j) =>
+    (j?.models ?? []).filter((m: { supportedGenerationMethods?: string[] }) => m.supportedGenerationMethods?.includes("generateContent")).map((m: { name: string }) => m.name.replace(/^models\//, "")));
+  const pref = [preferred, ...GEMINI_MODELS].filter((m): m is string => !!m && (ALLOWED_GEMINI.has(m) || !!ids?.includes(m)));
+  return choose(pref, ids, /^gemini-([\d.]+-)?flash(-lite)?(-latest)?$/, 5);
+}
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -110,6 +150,7 @@ Deno.serve(async (req) => {
       problems.push(`${id}: ${e instanceof Error ? e.message : e}`);
     }
   }
+  console.error("all services failed:", problems.join(" | ").slice(0, 1500));
   return json({
     error: "busy",
     message: available.length
@@ -121,11 +162,11 @@ Deno.serve(async (req) => {
 
 /* =========================== Gemini =========================== */
 async function tryGemini(input: Input, key: string): Promise<{ response?: Response; fatal?: Response; problem: string }> {
-  const models = [...new Set([input.model, ...GEMINI_MODELS].filter((m): m is string => !!m && ALLOWED_GEMINI.has(m)))].slice(0, 3);
+  const models = await geminiModels(key, input.model);
   let problem = "";
   for (const model of models) {
     let useSearch = !!input.search && !input.json;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       const body: Record<string, unknown> = { contents: input.contents, generationConfig: { maxOutputTokens: Math.min(Number(input.maxTokens) || 8192, 32000) } };
       // Without Google Search, a current-affairs or factual question gets live headlines and Wikipedia facts fetched by this server.
       const live = input.search && !useSearch && !input.json ? await liveContext(input) : null;
@@ -159,9 +200,11 @@ async function tryGemini(input: Input, key: string): Promise<{ response?: Respon
       const err = await res.json().catch(() => ({}));
       const msg: string = err?.error?.message ?? res.statusText;
       problem = `${model}: ${res.status} ${msg}`;
+      console.warn(problem.slice(0, 300));
       if (res.status === 400 && useSearch && /search|tool/i.test(msg)) { useSearch = false; attempt--; continue; }
       if (res.status === 400 && /api key/i.test(msg)) return { problem: "Gemini key invalid" };
       if (res.status === 404) break;
+      if (res.status === 429 && /per ?day|daily|quota/i.test(msg)) break;   // used up for today: go straight to the next model
       if (res.status === 429 || res.status >= 500) { if (attempt === 0) { await sleep(1200); continue; } break; }
       return { fatal: json({ error: "gemini_error", message: msg }, 400), problem };
     }
@@ -176,7 +219,9 @@ async function transcribe(part: { mime_type: string; data: string }): Promise<st
   const key = Deno.env.get("GROQ_API_KEY");
   if (!key) throw new Error("audio needs Gemini or a Groq key");
   const ext = ({ "audio/mpeg": "mp3", "audio/mp4": "m4a", "audio/wav": "wav", "audio/ogg": "ogg", "audio/webm": "webm", "audio/flac": "flac", "audio/aac": "m4a" } as Record<string, string>)[part.mime_type] ?? "mp3";
-  for (const model of WHISPER) {
+  const groq = PROVIDERS.find((p) => p.id === "groq")!;
+  const ids = await modelIds("groq", groq.base + "/models", { Authorization: "Bearer " + key }, (j) => (j?.data ?? []).map((m: { id: string }) => m.id));
+  for (const model of choose(WHISPER, ids, /whisper/i)) {
     const form = new FormData();
     form.append("file", new Blob([b64ToBytes(part.data)], { type: part.mime_type }), "recording." + ext);
     form.append("model", model);
@@ -238,36 +283,63 @@ async function prepare(input: Input): Promise<Prepared | null> {
 async function tryOpenAI(p: Provider, input: Input, prep: Prepared): Promise<Response | null> {
   const key = Deno.env.get(p.keyEnv)!;
   if (prep.hasImage && !p.vision?.length) return null;
-  const models = prep.hasImage ? p.vision! : [...(input.search && !input.json && !prep.live && p.search ? p.search : []), ...p.text];
-  const maxTokens = Math.min(Number(input.maxTokens) || 4096, 8000);
+  const models = prep.hasImage ? await providerModels(p, "vision")
+    : [...(input.search && !input.json && !prep.live ? await providerModels(p, "search") : []), ...await providerModels(p, "text")];
+  if (!models.length) return null;
   for (const model of [...new Set(models)]) {
-    const body: Record<string, unknown> = { model, messages: prep.messages, max_tokens: maxTokens, temperature: 0.2, stream: !!input.stream };
+   let messages = prep.messages, maxTokens = Math.min(Number(input.maxTokens) || 4096, 8000);
+   for (let attempt = 0; attempt < 3; attempt++) {
+    const body: Record<string, unknown> = { model, messages, max_tokens: maxTokens, temperature: 0.2, stream: !!input.stream };
     if (input.json) body.response_format = { type: "json_object" };
     let res: Response;
     try {
       res = await fetch(p.base + "/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + key, ...(p.headers ?? {}) }, body: JSON.stringify(body) });
-    } catch { continue; }
+    } catch { break; }
     if (!res.ok) {
       const detail = (await res.text()).slice(0, 300);
       console.error(`${p.name} ${model}: ${res.status} ${detail}`);
       if (res.status === 401) throw new Error(`${p.keyEnv} is invalid`);
-      continue;
+      // Too big for this free model: shorten the background material and the reply length, then try once more.
+      if (attempt < 2 && (res.status === 413 || (res.status === 400 && /context|too (large|long)|reduce|maximum/i.test(detail)))) {
+        const m = detail.match(/Limit (\d+), Requested (\d+)/);
+        const limit = m ? Number(m[1]) : 6000;
+        maxTokens = Math.max(600, Math.min(maxTokens, Math.floor(limit * 0.3)));
+        messages = shrink(messages, Math.max(3000, Math.floor((limit - maxTokens - 400) * 3 / (attempt + 1))));
+        continue;
+      }
+      break;
     }
     const headers = { ...cors, "X-Model": model, "X-Provider": p.id };
     if (input.stream) {
       const stream = await primed(openAIToGeminiStream(res.body!), prep.live?.sources);
       if (stream) { console.log(`answered by ${p.name}`, model); return new Response(stream, { headers: { ...headers, "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } }); }
-      console.warn(`${p.name} ${model}: empty stream`); continue;
+      console.warn(`${p.name} ${model}: empty stream`); break;
     }
     const out = await res.json();
     let text: string = out.choices?.[0]?.message?.content ?? "";
-    if (!text.trim()) continue;
+    if (!text.trim()) break;
     if (input.json) text = unwrapJson(text);
     if (prep.transcript) text = text.replace(/\n#{1,3}\s*Transcript[\s\S]*$/i, "").trim() + "\n\n## Transcript\n" + prep.transcript;
     console.log(`answered by ${p.name}`, model);
     return json({ candidates: [{ content: { parts: [{ text }] }, ...(prep.live ? { groundingMetadata: sourcesMeta(prep.live.sources) } : {}) }], model, provider: p.id }, 200, headers);
+   }
   }
   return null;
+}
+
+// Cut the longest pieces of text (usually background notes) until the request fits, keeping the start and the end.
+function shrink(messages: Record<string, unknown>[], budget: number): Record<string, unknown>[] {
+  const msgs = structuredClone(messages) as { role: string; content: string | { type: string; text?: string }[] }[];
+  const texts = () => msgs.flatMap((m, i) => typeof m.content === "string" ? [{ i, j: -1, t: m.content }] : m.content.map((c, j) => ({ i, j, t: c.text ?? "" })));
+  for (let n = 0; n < 12; n++) {
+    const all = texts(), total = all.reduce((s, x) => s + x.t.length, 0);
+    if (total <= budget) break;
+    const big = all.sort((a, b) => b.t.length - a.t.length)[0];
+    const keep = Math.max(400, big.t.length - (total - budget) - 200);
+    const cut = big.t.slice(0, Math.floor(keep * 0.6)) + "\n…(shortened)…\n" + big.t.slice(big.t.length - Math.floor(keep * 0.4));
+    if (big.j === -1) msgs[big.i].content = cut; else (msgs[big.i].content as { text?: string }[])[big.j].text = cut;
+  }
+  return msgs;
 }
 
 /* ===================== Live news and facts ===================== */

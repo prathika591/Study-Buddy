@@ -1,5 +1,5 @@
 // Keeps the app shell available offline. Questions still need internet.
-const CACHE = "study-buddy-v19";
+const CACHE = "study-buddy-v20";
 const SHELL = ["./", "index.html", "app.css", "app.js", "config.js", "manifest.json", "icons/icon-192.png", "icons/icon-512.png", "icons/icon-32.png"];
 const LAME = "https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js";
 
