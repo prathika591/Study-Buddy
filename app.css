@@ -489,3 +489,5 @@ dialog::backdrop{background:rgba(43,33,71,.45);backdrop-filter:blur(3px)}
 .pw-set .pw-eye{top:3px}
 #addDlg.rec-mode [data-add=camera],#addDlg.rec-mode [data-add=photo],#addDlg.rec-mode [data-add=pdf],#addDlg.rec-mode [data-add=text]{display:none}
 #addDlg.rec-mode .menu{grid-template-columns:1fr}
+.orig-lang{margin-top:12px}
+.orig-lang summary{cursor:pointer;font-weight:800;color:var(--muted);padding:8px 2px}

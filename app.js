@@ -299,7 +299,7 @@ async function callAI({ contents, system = SYSTEM, search = false, json = false,
     fe.busy = res.status === 503 || res.status >= 500 || (res.status === 429 && err.error !== "daily_limit");
     throw fe;
   }
-  const backup = res.headers.get("X-Provider") === "groq";
+  const backup = !!res.headers.get("X-Provider") && res.headers.get("X-Provider") !== "gemini";
   if (!stream) {
     const out = await res.json();
     const cand = out.candidates?.[0];
@@ -632,7 +632,7 @@ function setAccountUI() {
    6. Sign in, setup and shared notes (pages shown outside the app)
    ===================================================================== */
 let authMsg = "";
-const APP_VERSION = "18";
+const APP_VERSION = "19";
 const authErr = e => {
   const m = e?.message || "";
   if (/invalid login credentials/i.test(m)) return "Wrong email or password. Try again, or tap Forgot password.";
@@ -1054,7 +1054,10 @@ function renderNote(id) {
   }
   let body;
   if (tab === "notes") body = (n.thumbs?.length ? `<div class="thumbs">${n.thumbs.map(t => `<img src="${esc(t)}" alt="">`).join("")}</div>` : "") + `<div class="note-card body">${md(n.notes)}</div>`;
-  else if (tab === "transcript") body = `<div class="note-card transcript-text">${esc(n.transcript)}</div>`;
+  else if (tab === "transcript") {
+    const m = n.transcript.match(ORIGINAL_HEAD), eng = m ? n.transcript.slice(0, m.index).trim() : n.transcript, orig = m ? n.transcript.slice(m.index + m[0].length).trim() : "";
+    body = `<div class="note-card transcript-text">${esc(eng)}</div>${orig ? `<details class="orig-lang"><summary>Original language</summary><div class="note-card transcript-text">${esc(orig)}</div></details>` : ""}`;
+  }
   else if (tab === "flash") body = flashHTML(n);
   else body = quizHTML(n);
   const actions = (tab === "notes" || tab === "transcript") ? `<div class="actions">
@@ -1062,6 +1065,8 @@ function renderNote(id) {
       <button class="btn" data-act="edit" data-id="${esc(n.id)}" data-field="${tab === "transcript" ? "transcript" : "notes"}">${svg("edit")}Edit</button>
       <button class="btn" data-act="share" data-id="${esc(n.id)}">${svg("share")}${n.share_id ? "Share link" : "Share"}</button>
       ${n.share_id ? `<button class="btn" data-act="unshare" data-id="${esc(n.id)}">Stop sharing</button>` : ""}
+      ${tab === "transcript" && !ORIGINAL_HEAD.test(n.transcript) ? `<button class="btn" data-act="translate" data-id="${esc(n.id)}" ${ui.generating[n.id + "tr"] ? "disabled" : ""}>${ui.generating[n.id + "tr"] ? "Translating…" : "Translate to English"}</button>` : ""}
+      ${tab === "notes" && n.transcript ? `<button class="btn" data-act="redo-notes" data-id="${esc(n.id)}" ${ui.generating[n.id + "redo"] ? "disabled" : ""}>${ui.generating[n.id + "redo"] ? "Writing…" : "Redo as detailed English notes"}</button>` : ""}
       <button class="btn" data-act="pdf-note" data-id="${esc(n.id)}">${svg("download")}Download PDF</button>
       <button class="btn" data-act="copy-note" data-id="${esc(n.id)}">Copy</button>
       <button class="btn danger" data-act="delete-note" data-id="${esc(n.id)}">${svg("trash")}Delete</button></div>` : "";
@@ -1348,6 +1353,8 @@ view.addEventListener("click", async e => {
       if (state.pinned === id) state.pinned = null;
       toast("Deleted"); go("#/subject/" + (n.subject_id && subjectById(n.subject_id) ? n.subject_id : "unsorted")); break;
     case "retry": if (autoRetry[id]?.timer) clearTimeout(autoRetry[id].timer); processNote(id); break;
+    case "translate": translateNote(id); break;
+    case "redo-notes": redoNotes(id); break;
     case "make-flash": makeStudyItems(id, "flash"); break;
     case "make-quiz": makeStudyItems(id, "quiz"); break;
     case "fc-flip": ui.fc.flipped = !ui.fc.flipped; renderNote(ui.fc.id); break;
@@ -1487,33 +1494,87 @@ function notesPrompt(n, fromTranscript = false) {
   const isAudio = !fromTranscript && (n.source === "recording" || n.source === "audio");
   return `${intro}${s ? ` The subject is ${s.name}${s.code ? " (" + s.code + ")" : ""}.` : ""}
 
+Write DETAILED study notes in ENGLISH. The class may be in Tamil, Hindi, another language, or a mix with English: translate everything into clear English, keeping technical terms, names and formulas as they are.
+The notes must be complete enough that a student who missed the class can learn everything from them alone. Cover every topic, explanation, definition, example, step, reason and tip that was given, in the order it was taught. Don't shorten it into a brief summary.
+
 Start with one line exactly like this:
 TITLE: <the main topic in at most 8 words>
 
-Then write study notes in this structure:
+Then use this structure:
 
 ## Summary
-3 to 5 sentences on what it covers.
+A short paragraph on what was covered and why it matters.
 
-## Key points
-Bullet points of the main ideas, in order.
+## Detailed notes
+One ### subheading for each topic, in the order taught. Under each: explain the idea in full sentences, then bullet points for every detail, definition, step and example given. Include worked examples step by step, and anything the teacher said was important or would come in the exam.
 
 ## Important terms
-Bullet points: **term** – short definition.
+Bullet points: **term** – clear definition in a sentence or two.
 
-## Formulas and examples
-Only if there are any. Skip this heading otherwise.
+## Formulas and worked examples
+Every formula with what each symbol means, and every solved example step by step. Use LaTeX in $...$ for maths. Skip this heading if there are none.
+
+## Exam tips
+What the teacher stressed, common mistakes and likely questions. Skip this heading if nothing like this was said.
 
 ## Homework, deadlines and action items
 Bullet points, or "None mentioned".
 
 ## Check yourself
-3 short questions to test understanding.
+5 questions to test understanding, each followed by a short answer.
 ${isAudio ? `
 ## Transcript
-The full transcript, with filler words removed and speaker labels (Teacher, Student, Speaker 1…) when you can tell them apart.
+The full transcript IN ENGLISH, with filler words removed and speaker labels (Teacher, Student, Speaker 1…) when you can tell them apart. Translate any speech that isn't in English.
+If any of the speech was not in English, add one more section after it:
+
+## Original language
+The word-for-word transcript in the language actually spoken.
 ` : ""}
-Write the notes in English. If parts are in Tamil or another language, translate them in the notes${isAudio ? " and keep the transcript in the language spoken" : ""}. Use **bold** for key terms. Don't invent anything that isn't in the material.`;
+Use **bold** for key terms. Don't invent anything that isn't in the material.`;
+}
+const ORIGINAL_HEAD = /^#{1,3}\s*Original language.*$/im;
+const translatePrompt = text => `Below is part of a transcript of a college class or meeting. It may be in Tamil, Hindi, another language, or a mix with English (including Tamil or Hindi written in English letters).
+If it is already entirely in English, reply with exactly: ALREADY_ENGLISH
+Otherwise translate ALL of it into clear, natural English. Keep speaker labels, line breaks, technical terms, names and numbers. Don't summarise or leave anything out. Reply with the translation only.
+
+TRANSCRIPT:
+${text}`;
+// Translates long text a piece at a time. Returns null if it was already English.
+async function translateToEnglish(text, onStep) {
+  const pieces = [], paras = text.split(/\n(?=\S)/); let cur = "";
+  for (const p of paras) { if (cur && (cur + "\n" + p).length > 12000) { pieces.push(cur); cur = p; } else cur = cur ? cur + "\n" + p : p; }
+  if (cur) pieces.push(cur);
+  const out = []; let changed = false;
+  for (let i = 0; i < pieces.length; i++) {
+    onStep?.(i, pieces.length);
+    const r = await callAI({ maxTokens: 16000, system: "You are an accurate translator.", contents: [{ role: "user", parts: [{ text: translatePrompt(pieces[i]) }] }] });
+    const t = r.text.trim();
+    if (/^ALREADY_ENGLISH\b/.test(t)) out.push(pieces[i]); else { out.push(t); changed = true; }
+  }
+  return changed ? out.join("\n") : null;
+}
+async function translateNote(id) {
+  const n = noteById(id); if (!n?.transcript || ui.generating[id + "tr"]) return;
+  ui.generating[id + "tr"] = true; rerender();
+  try {
+    const eng = await translateToEnglish(n.transcript, (i, total) => total > 1 && toast(`Translating part ${i + 1} of ${total}…`));
+    if (!eng) toast("This transcript is already in English.");
+    else { await patchNote(n, { transcript: eng + "\n\n## Original language\n" + n.transcript }); toast("Translated to English. The original is kept below it."); }
+  } catch (e) { toast(e.busy ? "The AI is busy. Try again in a minute." : "Couldn't translate it. Try again."); }
+  ui.generating[id + "tr"] = false; rerender();
+}
+async function redoNotes(id) {
+  const n = noteById(id); if (!n?.transcript || ui.generating[id + "redo"]) return;
+  ui.generating[id + "redo"] = true; rerender();
+  try {
+    const m = n.transcript.match(ORIGINAL_HEAD), src = m ? n.transcript.slice(0, m.index) : n.transcript;
+    const r = await callAI({ maxTokens: 24000, system: "You turn class material into detailed, accurate study notes in English for a college student.",
+      contents: [{ role: "user", parts: [{ text: notesPrompt(n, true) + "\n\nTRANSCRIPT:\n" + src.slice(0, 400000) }] }] });
+    let text = r.text; const t = text.match(/^\s*\**TITLE:?\**\s*(.+)$/im); if (t) text = text.replace(t[0], "").trim();
+    const cut = text.search(/^#{1,3}\s*Transcript\s*$/im); if (cut > -1) text = text.slice(0, cut);
+    await patchNote(n, { notes: text.trim() }); toast("Your notes have been rewritten in detail.");
+  } catch (e) { toast(e.busy ? "The AI is busy. Try again in a minute." : "Couldn't redo the notes. Try again."); }
+  ui.generating[id + "redo"] = false; rerender();
 }
 const processing = new Set();
 const autoRetry = {};
@@ -1537,18 +1598,37 @@ async function processNote(id) {
         media.transcripts[i] = r.text.replace(/^#{1,3}\s*Transcript\s*/i, "").trim();
         await LocalDB.put("media", media).catch(() => {});
       }
-      transcript = media.transcripts.map((t, i) => audio.length > 1 ? `[${stamp(i * SEGMENT_MIN)}]\n${t}` : t).join("\n\n");
+      // Translate any part that isn't in English (each part is saved, so a retry carries on).
+      media.english ||= [];
+      for (let i = 0; i < audio.length; i++) {
+        if (media.english[i] !== undefined) continue;
+        setProgress(id, `Translating part ${i + 1} of ${audio.length} into English`, (i + .5) / (audio.length + 1));
+        media.english[i] = /^\(no speech\)$/i.test(media.transcripts[i]) ? null : await translateToEnglish(media.transcripts[i]);
+        await LocalDB.put("media", media).catch(() => {});
+      }
+      const join = arr => arr.map((t, i) => `[${stamp(i * SEGMENT_MIN)}]\n${t}`).join("\n\n");
+      const english = media.transcripts.map((t, i) => media.english[i] ?? t);
+      transcript = join(english) + (media.english.some(Boolean) ? "\n\n## Original language\n" + join(media.transcripts) : "");
+      const englishOnly = join(english);
       setProgress(id, "Writing your notes", audio.length / (audio.length + 1));
-      const r = await callAI({ maxTokens: 16000, system: "You turn class material into clear, accurate study notes for a college student.",
-        contents: [{ role: "user", parts: [{ text: notesPrompt(n, true) + "\n\nTRANSCRIPT:\n" + transcript.slice(0, 400000) }] }] });
+      const r = await callAI({ maxTokens: 24000, system: "You turn class material into detailed, accurate study notes in English for a college student.",
+        contents: [{ role: "user", parts: [{ text: notesPrompt(n, true) + "\n\nTRANSCRIPT:\n" + englishOnly.slice(0, 400000) }] }] });
       text = r.text;
     } else {
       const parts = [];
       for (const p of media.parts || []) parts.push({ inline_data: { mime_type: p.mime, data: await blobToBase64(p.blob) } });
       parts.push({ text: notesPrompt(n) + (media.text ? "\n\nTEXT:\n" + media.text : "") });
       setProgress(id, audio.length ? "Listening and writing notes" : "Reading and writing notes", .4);
-      const r = await callAI({ contents: [{ role: "user", parts }], maxTokens: 32000, system: "You turn class material into clear, accurate study notes for a college student." });
+      const r = await callAI({ contents: [{ role: "user", parts }], maxTokens: 32000, system: "You turn class material into detailed, accurate study notes in English for a college student." });
       text = r.text;
+      // The backup AIs add the transcript as it was spoken, so translate it here if it isn't in English.
+      const tcut = text.search(/^#{1,3}\s*Transcript\s*$/im);
+      if (r.backup && tcut > -1 && !ORIGINAL_HEAD.test(text)) {
+        setProgress(id, "Translating the transcript into English", .8);
+        const orig = text.slice(tcut).replace(/^#{1,3}\s*Transcript\s*/i, "").trim();
+        const eng = await translateToEnglish(orig).catch(() => null);
+        if (eng) text = text.slice(0, tcut) + "## Transcript\n" + eng + "\n\n## Original language\n" + orig;
+      }
     }
     const t = text.match(/^\s*\**TITLE:?\**\s*(.+)$/im);
     if (t) text = text.replace(t[0], "").trim();
